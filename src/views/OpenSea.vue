@@ -129,6 +129,7 @@ function initPerfEngine() {
    Uniforms
    --------------------------------------------------------------------------- */
 const uTime = uniform(0.0)
+const uCloudTime = uniform(0.0)
 const uSeaUniform = uniform(0.925)
 const uSunDir = uniform(new THREE.Vector3(0, 1, 0))
 const uSunColor = uniform(new THREE.Color(1, 1, 1))
@@ -237,6 +238,16 @@ const fbm = Fn(([p]) => {
   return val
 })
 
+/** Sky clouds use a fixed 3-octave FBM so adaptive quality never morphs cloud shapes. */
+const cloudFbm = Fn(([p]) => {
+  const n0 = gradNoise(p)
+  const p1 = p.mul(2.03).add(vec2(17.3, 9.1))
+  const n1 = gradNoise(p1)
+  const p2 = p1.mul(2.01).add(vec2(25.4, 19.5))
+  const n2 = gradNoise(p2)
+  return n0.add(n1.mul(0.5)).add(n2.mul(0.25))
+})
+
 const detailHeight = Fn(([xz, time]) => {
   const driftA = vec2(time.mul(0.55), time.mul(0.32))
   const driftB = vec2(time.mul(-0.4), time.mul(0.5))
@@ -263,14 +274,27 @@ const skyColor = Fn(([dir]) => {
 const skyDomeColor = Fn(() => {
   const dir = normalize(positionLocal)
   const col = skyColor(dir).toVar()
-  const band = smoothstep(0.03, 0.16, dir.y).mul(smoothstep(0.6, 0.22, dir.y))
-  const cloudUV = dir.xz.div(dir.y.add(0.18)).mul(0.55)
-  const cloudDrift = vec2(uTime.mul(0.006), uTime.mul(0.003))
-  const cloudNoise = fbm(cloudUV.add(cloudDrift)).mul(0.5).add(0.5)
-  const cloudMask = smoothstep(0.62, 0.95, cloudNoise).mul(band)
+
+  // Soft vertical band (wide edges so clouds fade in/out instead of clipping)
+  const band = smoothstep(0.01, 0.14, dir.y).mul(smoothstep(0.78, 0.26, dir.y))
+
+  // Stable mapping: larger y bias reduces horizon UV blow-up when looking around
+  const cloudUV = dir.xz.div(max(dir.y.add(0.42), 0.22)).mul(0.40)
+
+  // Dual-layer drift on wall-clock cloud time — continuous, independent of simSpeed spikes
+  const driftA = vec2(uCloudTime.mul(0.0038), uCloudTime.mul(0.0019))
+  const driftB = vec2(uCloudTime.mul(-0.0062), uCloudTime.mul(0.0041))
+  const nA = cloudFbm(cloudUV.mul(0.85).add(driftA)).mul(0.5).add(0.5)
+  const nB = cloudFbm(cloudUV.mul(1.65).add(driftB)).mul(0.5).add(0.5)
+  const cloudNoise = nA.mul(0.68).add(nB.mul(0.32))
+
+  // Wide smoothstep = soft formation / dissolution (no hard pop-in)
+  const density = smoothstep(0.40, 0.82, cloudNoise)
+  const cloudMask = density.mul(density).mul(band)
+
   const sunTint = normalize(uSunColor.add(vec3(0.0001)))
   const cloudColor = vec3(0.92, 0.90, 0.87).mul(mix(vec3(1.0), sunTint, 0.35))
-  col.assign(mix(col, cloudColor, clamp(cloudMask, 0.0, 1.0).mul(0.6)))
+  col.assign(mix(col, cloudColor, clamp(cloudMask, 0.0, 1.0).mul(0.52)))
 
   // Moon: full circular disc (圆形)
   // Moon sits opposite the sun with a slight inclination offset
@@ -964,6 +988,9 @@ async function frame() {
   // Advance ocean and fish simulation (paused when simPaused)
   if (!simPaused.value) {
     uTime.value += dt * simSpeed.value
+    // Clouds drift on a damped wall-clock so storm/demo speed spikes never teleport them
+    const cloudRate = 0.55 + Math.min(simSpeed.value, 1.2) * 0.45
+    uCloudTime.value += dt * cloudRate
 
     // Update fish simulation and switch camera if needed
     if (fishSystem.value?.ready) {
@@ -1014,14 +1041,10 @@ async function frame() {
 }
 
 /* ---------------------------------------------------------------------------
-   Init
+   Init — WebGPURenderer prefers WebGPU, falls back to WebGL2 automatically
    --------------------------------------------------------------------------- */
 async function init() {
-  if (!('gpu' in navigator) || !navigator.gpu) {
-    console.error('[OpenSea] WebGPU unavailable')
-    emit('error', '当前浏览器不支持 WebGPU，请使用 Chrome / Edge 113+')
-    return
-  }
+  const hasWebGPU = typeof navigator !== 'undefined' && !!navigator.gpu
   try {
     emitProgress(0.22, '检测 GPU…')
     await nextTick()
@@ -1032,11 +1055,26 @@ async function init() {
     PERF.initPixelRatio()
     uFbmOctaves.value = PERF.cfg.fbm
 
-    emitProgress(0.32, '初始化 WebGPU…')
+    emitProgress(0.32, hasWebGPU ? '初始化渲染器（WebGPU）…' : '初始化渲染器（WebGL2）…')
     await yieldToMain()
     if (disposed || !containerRef.value) return
 
-    renderer = new THREE.WebGPURenderer({ antialias: true, powerPreference: 'high-performance' })
+    renderer = new THREE.WebGPURenderer({
+      antialias: true,
+      powerPreference: 'high-performance',
+    })
+    // Resolves WebGPU when available; otherwise Three falls back to WebGL2.
+    await renderer.init()
+    if (disposed) {
+      renderer.dispose()
+      return
+    }
+
+    const backend = renderer.backend
+    const usingWebGPU = !!(backend && (backend.isWebGPUBackend || backend.constructor?.name === 'WebGPUBackend'))
+    console.info(`[OpenSea] renderer backend: ${usingWebGPU ? 'WebGPU' : 'WebGL2'}`)
+    emitProgress(0.38, usingWebGPU ? 'WebGPU 就绪…' : 'WebGL2 就绪…')
+
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     renderer.setSize(containerRef.value.clientWidth, containerRef.value.clientHeight)
     renderer.toneMapping = THREE.ACESFilmicToneMapping
@@ -1116,21 +1154,12 @@ async function init() {
     initialCamState.pos.copy(initialPose.pos)
     initialCamState.target.copy(initialPose.target)
 
-    emitProgress(0.78, '编译着色器…')
-    await yieldToMain()
-    if (disposed) return
-    await renderer.init()
-    if (disposed) {
-      renderer.setAnimationLoop(null)
-      return
-    }
-
     emitProgress(0.92, '即将就绪…')
     lastNow = performance.now()
     renderer.setAnimationLoop(frame)
   } catch (err) {
     console.error('[OpenSea] initialization failed:', err)
-    emit('error', '场景初始化失败，请刷新重试')
+    emit('error', '当前浏览器无法启动渲染（需要 WebGPU 或 WebGL2），请升级 Chrome / Edge / Firefox / Safari')
   }
 }
 

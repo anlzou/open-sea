@@ -214,15 +214,21 @@ export function createPerfEngine(ctx) {
     const screenArea = window.innerWidth * window.innerHeight
     let gpuPower = dpr * 4
     try {
-      const adapter = await navigator.gpu.requestAdapter()
-      if (adapter) {
-        const info = adapter.info || {}
-        const vendor = (info.vendor || '').toLowerCase()
-        const arch = (info.architecture || '').toLowerCase()
-        const isLowEnd = /intel|mesa|llvmpipe|swiftshader|mali(?!(g7|g8))/.test(vendor + arch)
-        const isHighEnd = /nvidia|amd|radeon|apple(?=.*(?:m[2-4]|a17|ultra))/i.test(vendor + arch)
-        if (isLowEnd) gpuPower *= 0.4
-        if (isHighEnd) gpuPower *= 2.2
+      if (navigator.gpu?.requestAdapter) {
+        const adapter = await navigator.gpu.requestAdapter()
+        if (adapter) {
+          const info = adapter.info || {}
+          const vendor = (info.vendor || '').toLowerCase()
+          const arch = (info.architecture || '').toLowerCase()
+          const isLowEnd = /intel|mesa|llvmpipe|swiftshader|mali(?!(g7|g8))/.test(vendor + arch)
+          const isHighEnd = /nvidia|amd|radeon|apple(?=.*(?:m[2-4]|a17|ultra))/i.test(vendor + arch)
+          if (isLowEnd) gpuPower *= 0.4
+          if (isHighEnd) gpuPower *= 2.2
+          if (screenArea > 3_600_000) gpuPower *= 0.7
+        }
+      } else {
+        // WebGL2-only path: start one tier more conservative
+        gpuPower *= 0.55
         if (screenArea > 3_600_000) gpuPower *= 0.7
       }
     } catch { /* ignore */ }

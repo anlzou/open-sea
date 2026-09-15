@@ -79,7 +79,7 @@ onBeforeUnmount(() => {
         <div class="sea-loader-copy">
           <div class="sea-loader-eyebrow">Realtime Ocean</div>
           <h1 class="sea-loader-title">OPEN SEA</h1>
-          <p class="sea-loader-sub">WebGPU · TSL · Gerstner</p>
+          <p class="sea-loader-sub">WebGPU / WebGL2 · TSL · Gerstner</p>
         </div>
 
         <div class="sea-loader-mark" aria-hidden="true">

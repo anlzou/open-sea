@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "type": "module",
   "license": "AGPL-3.0",
-  "description": "Realtime procedural ocean — WebGPU · Three.js TSL · Gerstner · Boids",
+  "description": "Realtime procedural ocean — WebGPU/WebGL2 · Three.js TSL · Gerstner · Boids",
   "author": "anlzou",
   "scripts": {
     "dev": "vite",

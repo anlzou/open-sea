@@ -1,6 +1,6 @@
 # Open Sea
 
-Realtime procedural ocean — WebGPU · Three.js TSL · Gerstner swell · Boids fish · weather.
+Realtime procedural ocean — WebGPU (WebGL2 fallback) · Three.js TSL · Gerstner swell · Boids fish · weather.
 
 Extracted from [procedural-modeling-demo](https://github.com/anlzou/procedural-modeling-demo). See [docs/PLAN.md](docs/PLAN.md).
 
@@ -11,7 +11,7 @@ bun install   # or pnpm / npm
 bun run dev
 ```
 
-Requires a WebGPU-capable browser.
+Uses Three.js `WebGPURenderer`: prefers WebGPU, automatically falls back to **WebGL2** when WebGPU is unavailable. Needs a modern browser with WebGPU or WebGL2.
 
 Production build deploys under `/open-sea/`:
 
