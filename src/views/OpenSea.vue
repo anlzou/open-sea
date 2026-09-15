@@ -1,0 +1,1302 @@
+<script setup>
+import { ref, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import * as THREE from 'three/webgpu'
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
+import { bloom } from 'three/addons/tsl/display/BloomNode.js'
+import {
+  Fn, pass, uniform, float, vec2, vec3, vec4,
+  sin, cos, dot, cross, normalize, mix, pow, max, clamp,
+  fract, floor, smoothstep, distance, reflect, If,
+  positionLocal, positionWorld, cameraPosition
+} from 'three/tsl'
+import SeaDock from '../components/SeaDock.vue'
+import { t as i18nT } from '../utils/oceanI18n.js'
+import { createPerfEngine } from '../utils/oceanPerf.js'
+import {
+  dayPhaseAt,
+  demoWeatherHold,
+  nextDemoWeather,
+  initialDemoWeather,
+  WEATHER_CLEAR,
+  WEATHER_RAIN,
+  WEATHER_STORM,
+} from './demo-weather.js'
+
+const emit = defineEmits(['ready', 'progress', 'error'])
+
+function yieldToMain() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => setTimeout(resolve, 0))
+  })
+}
+
+function emitProgress(progress, label) {
+  emit('progress', { progress, label })
+}
+
+/* ---------------------------------------------------------------------------
+   Reactive state
+   --------------------------------------------------------------------------- */
+const containerRef = ref(null)
+const fpsDisplay = ref('--')
+const qualityLabel = ref('中')
+const qualityBadge = ref('自适应')
+const timeLabel = ref('午后')
+const timeSliderValue = ref(55)
+const realTimeMode = ref(true)
+const showTimeMark = ref(true)
+const demoMode = ref(false)
+const clockText = ref('13:12')
+const phaseText = ref('日间 · DAYLIGHT')
+const dateText = ref('')
+let shownClockMinutes = -1
+/** Demo clock in hours [0, 24), same pace as lofi-room (Δt/6). */
+let demoHour = 13.2
+let demoPrevHour = 13.2
+let demoDate = new Date()
+let savedRealTimeBeforeDemo = true
+let demoMeteorTimer = 0
+let demoWeatherTimer = 0
+const seaValue = ref('0.93')
+const seaSliderValue = ref(45)
+const currentLang = ref('zh')
+const driftEnabled = ref(true)
+
+// Fish system state
+const fishSystem = ref(null)
+const fishReady = ref(false)
+const fishCamActive = ref(false)
+const fishLoadError = ref('')
+const fishLoadProgress = ref(0)
+const fishModelKeys = ref([])
+const simPaused = ref(false)
+const simSpeed = ref(1)
+const aquariumSize = ref(20)
+const showBoundary = ref(false)
+
+// Weather system state
+const weatherSystem = ref(null)
+const weatherType = ref(0) // 0=clear, 1=snow, 2=rain, 3=storm
+const weatherLabels = ['☀️ Clear', '❄️ Snow', '🌧️ Rain', '🌪️ Storm']
+const lightningFlash = ref(0)
+
+// Meteor system state（轨迹模式配置，控制面板实时调整）
+const meteorCfg = ref({ mode: 'random', radiantBurst: 3, radiantSpread: 0.8 })
+
+// Fish slider display values (reactive mirrors for template binding)
+const fishDisplay = ref({
+  sardineCount: 0, koiCount: 0, perception: 2.7,
+  sardineSpeed: 1.0, separation: 1.35, avoidance: 10,
+  turnRate: 4, topMargin: 0.42,
+  koiPerception: 2.7, koiSpeed: 1.0, koiSeparation: 1.35,
+  koiAvoidance: 10, koiTurnRate: 4, koiTopMargin: 0.42,
+})
+
+function t(key) {
+  return i18nT(currentLang.value, key)
+}
+
+/* ---------------------------------------------------------------------------
+   Quality Manager — adaptive performance scaling (extracted)
+   Initialized after TSL shader functions are defined (see below).
+   --------------------------------------------------------------------------- */
+let PERF
+
+function initPerfEngine() {
+  PERF = createPerfEngine({
+    THREE,
+    sceneRef: () => scene,
+    rendererRef: () => renderer,
+    cameraRef: () => camera,
+    postProcessingRef: () => postProcessing,
+    wavePosition,
+    oceanColor,
+    skyDomeColor,
+    positionLocal,
+    pass,
+    bloom,
+    uTime,
+    uSeaUniform,
+    uFbmOctaves,
+    fpsDisplay,
+    qualityBadge,
+    qualityLabel,
+    t,
+  })
+}
+
+/* ---------------------------------------------------------------------------
+   Uniforms
+   --------------------------------------------------------------------------- */
+const uTime = uniform(0.0)
+const uSeaUniform = uniform(0.925)
+const uSunDir = uniform(new THREE.Vector3(0, 1, 0))
+const uSunColor = uniform(new THREE.Color(1, 1, 1))
+const uHorizonColor = uniform(new THREE.Color(0.52, 0.68, 0.82))
+const uZenithColor = uniform(new THREE.Color(0.07, 0.2, 0.42))
+const uDeepColor = uniform(new THREE.Color(0.015, 0.09, 0.11))
+const uShallowColor = uniform(new THREE.Color(0.06, 0.32, 0.36))
+const uFbmOctaves = uniform(3)
+const uNightFactor = uniform(0.0)
+const uLightning = uniform(0.0)
+const uLightningDir = uniform(new THREE.Vector3(0, 1, 0))
+
+/* ---------------------------------------------------------------------------
+   Waves — five directional Gerstner components
+   --------------------------------------------------------------------------- */
+const WAVE_DEFS = [
+  { dir: [1.0, 0.0], wavelength: 60.0, steepness: 0.12 },
+  { dir: [0.6, 0.8], wavelength: 31.0, steepness: 0.12 },
+  { dir: [-0.7, 0.7], wavelength: 18.0, steepness: 0.09 },
+  { dir: [0.3, -0.95], wavelength: 9.5, steepness: 0.07 },
+  { dir: [-0.35, -0.94], wavelength: 5.0, steepness: 0.05 }
+]
+
+const WAVES = WAVE_DEFS.map(({ dir, wavelength, steepness }) => {
+  const len = Math.hypot(dir[0], dir[1])
+  const k = (Math.PI * 2) / wavelength
+  return {
+    dir: vec2(dir[0] / len, dir[1] / len),
+    k: float(k),
+    c: float(Math.sqrt(9.8 * k)),
+    amp: float(steepness / k),
+    steep: float(steepness)
+  }
+})
+
+const wavePosition = Fn(([xz, time, sea]) => {
+  const pos = vec3(xz.x, 0.0, xz.y).toVar()
+  for (const w of WAVES) {
+    const a = w.amp.mul(sea)
+    const f = w.k.mul(dot(w.dir, xz).sub(time.mul(w.c)))
+    pos.x.addAssign(a.mul(w.dir.x).mul(cos(f)))
+    pos.y.addAssign(a.mul(sin(f)))
+    pos.z.addAssign(a.mul(w.dir.y).mul(cos(f)))
+  }
+  return pos
+})
+
+const waveNormal = Fn(([xz, time, sea]) => {
+  const tangent = vec3(1.0, 0.0, 0.0).toVar()
+  const binormal = vec3(0.0, 0.0, 1.0).toVar()
+  for (const w of WAVES) {
+    const wa = w.steep.mul(sea)
+    const f = w.k.mul(dot(w.dir, xz).sub(time.mul(w.c)))
+    const sf = sin(f)
+    const cf = cos(f)
+    tangent.x.addAssign(wa.negate().mul(w.dir.x).mul(w.dir.x).mul(sf))
+    tangent.y.addAssign(wa.mul(w.dir.x).mul(cf))
+    tangent.z.addAssign(wa.negate().mul(w.dir.x).mul(w.dir.y).mul(sf))
+    binormal.x.addAssign(wa.negate().mul(w.dir.x).mul(w.dir.y).mul(sf))
+    binormal.y.addAssign(wa.mul(w.dir.y).mul(cf))
+    binormal.z.addAssign(wa.negate().mul(w.dir.y).mul(w.dir.y).mul(sf))
+  }
+  return normalize(cross(binormal, tangent))
+})
+
+const waveCrest = Fn(([xz, time, sea]) => {
+  const crest = float(0.0).toVar()
+  for (const w of WAVES) {
+    const f = w.k.mul(dot(w.dir, xz).sub(time.mul(w.c)))
+    crest.addAssign(w.amp.mul(sea).mul(sin(f)))
+  }
+  return crest
+})
+
+/* ---------------------------------------------------------------------------
+   Noise — 2D gradient noise + FBM
+   --------------------------------------------------------------------------- */
+const hash2 = Fn(([p]) => {
+  const v = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)))
+  return fract(sin(v).mul(43758.5453)).mul(2.0).sub(1.0)
+})
+
+const gradNoise = Fn(([p]) => {
+  const i = floor(p)
+  const f = fract(p)
+  const u = f.mul(f).mul(f).mul(f.mul(f.mul(6.0).sub(15.0)).add(10.0))
+  const n00 = dot(hash2(i), f)
+  const n10 = dot(hash2(i.add(vec2(1.0, 0.0))), f.sub(vec2(1.0, 0.0)))
+  const n01 = dot(hash2(i.add(vec2(0.0, 1.0))), f.sub(vec2(0.0, 1.0)))
+  const n11 = dot(hash2(i.add(vec2(1.0, 1.0))), f.sub(vec2(1.0, 1.0)))
+  return mix(mix(n00, n10, u.x), mix(n01, n11, u.x), u.y)
+})
+
+const fbm = Fn(([p]) => {
+  const val = gradNoise(p).toVar()
+  const amp = float(0.5).toVar()
+  const pp = vec2(p.x, p.y).toVar()
+  If(uFbmOctaves.greaterThan(1), () => {
+    pp.mulAssign(2.04); pp.addAssign(vec2(17.3, 9.1))
+    val.addAssign(gradNoise(pp).mul(amp)); amp.mulAssign(0.5)
+  })
+  If(uFbmOctaves.greaterThan(2), () => {
+    pp.mulAssign(2.01); pp.addAssign(vec2(25.4, 19.5))
+    val.addAssign(gradNoise(pp).mul(amp)); amp.mulAssign(0.5)
+  })
+  return val
+})
+
+const detailHeight = Fn(([xz, time]) => {
+  const driftA = vec2(time.mul(0.55), time.mul(0.32))
+  const driftB = vec2(time.mul(-0.4), time.mul(0.5))
+  return fbm(xz.mul(0.85).add(driftA)).add(fbm(xz.mul(2.1).add(driftB)).mul(0.45))
+})
+
+/* ---------------------------------------------------------------------------
+   Sky
+   --------------------------------------------------------------------------- */
+const skyColor = Fn(([dir]) => {
+  const d = normalize(dir)
+  const up = clamp(d.y, -0.15, 1.0)
+  const col = mix(uHorizonColor, uZenithColor, pow(max(up, 0.0), 0.42)).toVar()
+  const haze = smoothstep(0.0, -0.15, d.y)
+  col.assign(mix(col, uDeepColor.mul(1.4).add(uHorizonColor.mul(0.25)), haze))
+  const s = max(dot(d, uSunDir), 0.0)
+  // Sun glow — soft halo
+  col.addAssign(uSunColor.mul(pow(s, 10.0).mul(0.18)))
+  // Sun disc — bright circle
+  col.addAssign(uSunColor.mul(smoothstep(0.9990, 0.9997, s).mul(40.0)))
+  return col
+})
+
+const skyDomeColor = Fn(() => {
+  const dir = normalize(positionLocal)
+  const col = skyColor(dir).toVar()
+  const band = smoothstep(0.03, 0.16, dir.y).mul(smoothstep(0.6, 0.22, dir.y))
+  const cloudUV = dir.xz.div(dir.y.add(0.18)).mul(0.55)
+  const cloudDrift = vec2(uTime.mul(0.006), uTime.mul(0.003))
+  const cloudNoise = fbm(cloudUV.add(cloudDrift)).mul(0.5).add(0.5)
+  const cloudMask = smoothstep(0.62, 0.95, cloudNoise).mul(band)
+  const sunTint = normalize(uSunColor.add(vec3(0.0001)))
+  const cloudColor = vec3(0.92, 0.90, 0.87).mul(mix(vec3(1.0), sunTint, 0.35))
+  col.assign(mix(col, cloudColor, clamp(cloudMask, 0.0, 1.0).mul(0.6)))
+
+  // Moon: full circular disc (圆形)
+  // Moon sits opposite the sun with a slight inclination offset
+  const moonDir = uSunDir.negate().add(vec3(0.0, 0.15, 0.0)).normalize()
+  const moonDot = max(dot(dir, moonDir), 0.0)
+
+  // Soft glow around the moon
+  const moonGlow = pow(moonDot, 6.0).mul(0.06)
+
+  // Full moon disc
+  const moonDisc = smoothstep(0.9992, 0.9997, moonDot).mul(4.0)
+
+  col.addAssign(uNightFactor.mul(vec3(0.30, 0.35, 0.55).mul(moonGlow.add(moonDisc))))
+
+  // 闪电闪光：云层带被照亮，并略偏向闪电所在方位
+  const flashDir = normalize(vec3(uLightningDir.x, float(0.0001), uLightningDir.z))
+  const skyAz = normalize(vec3(dir.x, float(0.0001), dir.z))
+  const azMask = mix(float(0.32), float(1.0), pow(max(dot(skyAz, flashDir), 0.0), 1.6))
+  const cloudBand = smoothstep(-0.04, 0.22, dir.y).mul(smoothstep(0.82, 0.18, dir.y))
+  col.addAssign(uLightning.mul(vec3(0.78, 0.86, 1.0)).mul(cloudBand.add(0.22)).mul(azMask))
+
+  return vec4(col, 1.0)
+})
+
+/* ---------------------------------------------------------------------------
+   Ocean
+   --------------------------------------------------------------------------- */
+const oceanColor = Fn(() => {
+  const P = positionWorld
+  const xz = P.xz
+  const N0 = waveNormal(xz, uTime, uSeaUniform)
+  const eps = 0.1
+  const h0 = detailHeight(xz, uTime)
+  const hx = detailHeight(xz.add(vec2(eps, 0.0)), uTime)
+  const hz = detailHeight(xz.add(vec2(0.0, eps)), uTime)
+  const detailGain = float(1.5).mul(uSeaUniform.mul(0.6).add(0.4))
+  const N = normalize(N0.add(vec3(h0.sub(hx), 0.0, h0.sub(hz)).mul(detailGain)))
+  const V = normalize(cameraPosition.sub(P))
+  const crest = waveCrest(xz, uTime, uSeaUniform)
+  const baseColor = mix(uDeepColor, uShallowColor, clamp(crest.mul(0.35).add(0.45), 0.0, 1.0))
+  const glow = pow(max(dot(V, uSunDir), 0.0), 3.0).mul(max(crest, 0.0)).mul(0.18)
+  const waterColor = baseColor.add(uShallowColor.mul(uSunColor).mul(glow)).toVar()
+  const R = reflect(V.negate(), N)
+  const RDir = normalize(vec3(R.x, max(R.y, 0.04), R.z))
+  const reflection = skyColor(RDir)
+  const fresnel = float(0.02).add(float(0.98).mul(pow(max(dot(N, V), 0.0).oneMinus(), 5.0)))
+  const col = mix(waterColor, reflection, fresnel).toVar()
+  const H = normalize(uSunDir.add(V))
+  const ndh = max(dot(N, H), 0.0)
+  const sparkleNoise = fbm(xz.mul(1.7).add(vec2(uTime.mul(0.9), uTime.mul(-0.7)))).mul(0.5).add(0.5)
+  const sparkle = pow(ndh, 500.0).mul(mix(0.4, 3.4, sparkleNoise))
+  const sheen = pow(ndh, 48.0).mul(0.12)
+  col.addAssign(uSunColor.mul(sparkle.add(sheen)))
+
+  // Moonlight reflection on water — moon opposite sun
+  const moonDir2 = uSunDir.negate().add(vec3(0.0, 0.15, 0.0)).normalize()
+  const Hmoon = normalize(moonDir2.add(V))
+  const ndhm = max(dot(N, Hmoon), 0.0)
+  const moonSpec = pow(ndhm, 80.0).mul(0.06)
+  col.addAssign(uNightFactor.mul(vec3(0.30, 0.35, 0.55).mul(moonSpec)))
+
+  const foamNoise = fbm(xz.mul(1.1).add(vec2(uTime.mul(0.22), uTime.mul(0.14)))).mul(0.5).add(0.5)
+  const foamMask = smoothstep(0.5, 0.95, foamNoise).mul(smoothstep(1.0, 2.0, crest))
+  col.assign(mix(col, vec3(0.82, 0.88, 0.90), clamp(foamMask.mul(0.85), 0.0, 1.0)))
+  const camDist = distance(cameraPosition, P)
+  col.assign(mix(col, uHorizonColor, smoothstep(150.0, 290.0, camDist)))
+
+  // 闪电闪光：从闪电方向打来的短暂高光，而不是整片加蓝
+  const Lflash = normalize(uLightningDir)
+  const Hflash = normalize(Lflash.add(V))
+  const flashSpec = pow(max(dot(N, Hflash), 0.0), 36.0)
+  const flashFill = max(dot(N, Lflash), 0.0).mul(0.28)
+  col.addAssign(uLightning.mul(vec3(0.72, 0.82, 1.0)).mul(flashSpec.add(flashFill).add(0.1)))
+
+  return vec4(col, 1.0)
+})
+
+// Initialize PERF engine after all TSL functions are defined
+initPerfEngine()
+
+/* ---------------------------------------------------------------------------
+   Scene variables
+   --------------------------------------------------------------------------- */
+let renderer, scene, camera, controls, postProcessing
+let meteorSystem = null
+let meteorLoadPromise = null
+let weatherLoadPromise = null
+let lastNow = 0
+let lastRealTimeSync = 0
+let revealed = false
+let disposed = false
+let secondaryScheduled = false
+let fpsAccum = 0
+let fpsCount = 0
+let onSpaceKey = null
+let onMeteorKey = null
+let onLightningKey = null
+/** Snapshot of the camera state when the page first loads */
+const initialCamState = { pos: new THREE.Vector3(), target: new THREE.Vector3() }
+
+/* ---------------------------------------------------------------------------
+   Time of day
+   --------------------------------------------------------------------------- */
+const DAY = {
+  zenith: new THREE.Color(0.07, 0.20, 0.42),
+  horizon: new THREE.Color(0.52, 0.68, 0.82),
+  sun: new THREE.Color(1.0, 0.93, 0.80),
+  intensity: 1.6,
+  deep: new THREE.Color(0.015, 0.09, 0.11),
+  shallow: new THREE.Color(0.06, 0.32, 0.36)
+}
+const DUSK = {
+  zenith: new THREE.Color(0.03, 0.05, 0.16),
+  horizon: new THREE.Color(0.85, 0.36, 0.16),
+  sun: new THREE.Color(1.0, 0.42, 0.14),
+  intensity: 2.6,
+  deep: new THREE.Color(0.02, 0.045, 0.075),
+  shallow: new THREE.Color(0.09, 0.15, 0.20)
+}
+const NIGHT = {
+  zenith: new THREE.Color(0.005, 0.008, 0.03),
+  horizon: new THREE.Color(0.08, 0.12, 0.25),
+  sun: new THREE.Color(0.30, 0.35, 0.55),
+  intensity: 0.3,
+  deep: new THREE.Color(0.002, 0.005, 0.015),
+  shallow: new THREE.Color(0.01, 0.03, 0.06)
+}
+
+function getTimeLabel(val) {
+  if (val < 0.15) return t('time.midnight')
+  if (val < 0.30) return t('time.dawn')
+  if (val < 0.70) return t('time.midday')
+  if (val < 0.85) return t('time.dusk')
+  return t('time.midnight')
+}
+
+const MONTHS_EN = ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', 'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER']
+
+/** Phase line matches lofi-room day-label thresholds (hour of day). */
+function getPhaseLabel(hour) {
+  if (hour < 5 || hour >= 19.5) return '夜色 · NIGHT'
+  if (hour < 8.5) return '晨曦 · DAWN'
+  if (hour >= 16.5) return '夕阳 · GOLDEN HOUR'
+  return '日间 · DAYLIGHT'
+}
+
+function updateDateText(now = new Date()) {
+  dateText.value = `${MONTHS_EN[now.getMonth()]} ${now.getDate()}, ${now.getFullYear()}`
+}
+
+/** Sync right-side clock from scene time t ∈ [0,1]. */
+function updateTimeMark(t) {
+  const minutes = Math.round(t * 24 * 60) % 1440
+  if (minutes === shownClockMinutes) return
+  shownClockMinutes = minutes
+  const h = Math.floor(minutes / 60)
+  const m = minutes % 60
+  clockText.value = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
+  phaseText.value = getPhaseLabel(t * 24)
+}
+
+function toggleTimeMark() {
+  showTimeMark.value = !showTimeMark.value
+  try {
+    localStorage.setItem('open-sea-time-mark', showTimeMark.value ? '1' : '0')
+  } catch { /* ignore */ }
+}
+
+function toggleDemoMode() {
+  demoMode.value = !demoMode.value
+  if (demoMode.value) {
+    savedRealTimeBeforeDemo = realTimeMode.value
+    realTimeMode.value = false
+    simPaused.value = false
+    demoHour = (timeSliderValue.value / 100) * 24
+    demoPrevHour = demoHour
+    demoDate = new Date()
+    updateDateText(demoDate)
+    demoMeteorTimer = 4 + Math.random() * 6
+    const opening = initialDemoWeather(demoHour)
+    setWeatherType(opening)
+    demoWeatherTimer = demoWeatherHold(opening, dayPhaseAt(demoHour))
+    ensureMeteor()
+  } else {
+    realTimeMode.value = savedRealTimeBeforeDemo
+    demoDate = new Date()
+    updateDateText(demoDate)
+    if (realTimeMode.value) syncTimeWithSystem()
+  }
+}
+
+function rollDemoWeather() {
+  const next = nextDemoWeather(weatherType.value, demoHour)
+  if (next === weatherType.value) {
+    // Soft re-roll once so holds do not feel stuck forever when "stay" wins.
+    const again = nextDemoWeather(weatherType.value, demoHour)
+    setWeatherType(again)
+    demoWeatherTimer = demoWeatherHold(again, dayPhaseAt(demoHour))
+    return
+  }
+  setWeatherType(next)
+  demoWeatherTimer = demoWeatherHold(next, dayPhaseAt(demoHour))
+}
+
+function advanceDemo(dt) {
+  demoPrevHour = demoHour
+  // lofi-room: hour = (hour + delta / 6) % 24  → ~2.4 min per scene day
+  demoHour = (demoHour + dt / 6) % 24
+  const t = demoHour / 24
+  timeSliderValue.value = Math.round(t * 100)
+  applyTimeOfDay(t)
+
+  const phase = dayPhaseAt(demoHour)
+  const prevPhase = dayPhaseAt(demoPrevHour)
+
+  // Midnight wrap → new calendar day; nudge weather with the director (often clear into the night).
+  if (demoPrevHour > demoHour) {
+    demoDate.setDate(demoDate.getDate() + 1)
+    updateDateText(demoDate)
+    rollDemoWeather()
+  }
+
+  // Entering night: clear the sky for meteors (storm eases through rain first).
+  if (prevPhase !== 'night' && phase === 'night') {
+    if (weatherType.value === WEATHER_CLEAR) {
+      demoWeatherTimer = Math.max(demoWeatherTimer, demoWeatherHold(WEATHER_CLEAR, 'night') * 0.65)
+    } else if (Math.random() < 0.75) {
+      if (weatherType.value === WEATHER_STORM) {
+        setWeatherType(WEATHER_RAIN)
+        demoWeatherTimer = 10 + Math.random() * 8
+      } else {
+        setWeatherType(WEATHER_CLEAR)
+        demoWeatherTimer = demoWeatherHold(WEATHER_CLEAR, 'night')
+      }
+    }
+  }
+
+  // Plausible timed transitions (小雨→大雨→转晴 等)
+  demoWeatherTimer -= dt
+  if (demoWeatherTimer <= 0) rollDemoWeather()
+
+  // Extra meteor bursts on clear nights
+  if (weatherType.value === WEATHER_CLEAR && uNightFactor.value > 0.55) {
+    ensureMeteor()
+    demoMeteorTimer -= dt
+    if (demoMeteorTimer <= 0) {
+      demoMeteorTimer = 5 + Math.random() * 12
+      if (Math.random() < 0.62) {
+        onMeteorMode(Math.random() < 0.7 ? 'random' : 'radiant')
+        onMeteorShower()
+      }
+    }
+  }
+}
+
+try {
+  if (localStorage.getItem('open-sea-time-mark') === '0') showTimeMark.value = false
+} catch { /* ignore */ }
+updateDateText()
+updateTimeMark(timeSliderValue.value / 100)
+
+function applyTimeOfDay(t) {
+  // Time-of-day cycle: 0=午夜(midnight) → 0.15=晨曦(dawn) → 0.30=正午(noon) → 0.70=黄昏(dusk) → 0.85=午夜 → 1.0
+  // Sun arcs east→south→west (azimuth = t * 2π), peaking at 1.0 rad (57°) at noon
+  let paletteT, paletteA, paletteB
+
+  // Palette transitions aligned with labels:
+  // 0──0.15 午夜(NIGHT) ──0.30 晨曦(NIGHT→DUSK→DAY) ──0.70 正午(DAY) ──0.85 黄昏(DUSK→NIGHT) ──1.0 午夜
+  if (t < 0.15) {
+    // Night (deep)
+    paletteT = 0
+    paletteA = NIGHT; paletteB = NIGHT
+  } else if (t < 0.22) {
+    // Dawn twilight: Night → Dusk
+    paletteT = (t - 0.15) / 0.07
+    paletteA = NIGHT; paletteB = DUSK
+  } else if (t < 0.30) {
+    // Sunrise: Dusk → Day
+    paletteT = (t - 0.22) / 0.08
+    paletteA = DUSK; paletteB = DAY
+  } else if (t < 0.70) {
+    // Day (midday plateau)
+    paletteT = 0
+    paletteA = DAY; paletteB = DAY
+  } else if (t < 0.78) {
+    // Sunset: Day → Dusk
+    paletteT = (t - 0.70) / 0.08
+    paletteA = DAY; paletteB = DUSK
+  } else if (t < 0.85) {
+    // Evening twilight: Dusk → Night
+    paletteT = (t - 0.78) / 0.07
+    paletteA = DUSK; paletteB = NIGHT
+  } else {
+    // Night (deep)
+    paletteT = 0
+    paletteA = NIGHT; paletteB = NIGHT
+  }
+
+  const w = paletteT
+
+  // Sun elevation: smooth arc peaking at 1.0 rad (57°) at noon
+  const noonPeak = 1.0  // radians — clearly visible above horizon
+  const nightLow = -0.35
+  let elevation
+  if (t < 0.15) {
+    elevation = nightLow
+  } else if (t < 0.30) {
+    // Dawn rise: below horizon → above
+    const p = (t - 0.15) / 0.15
+    const sp = p * p * (3 - 2 * p)  // smoothstep
+    elevation = THREE.MathUtils.lerp(nightLow, noonPeak * 0.4, sp)
+  } else if (t < 0.50) {
+    // Climb to zenith
+    const p = (t - 0.30) / 0.20
+    const sp = p * p * (3 - 2 * p)
+    elevation = THREE.MathUtils.lerp(noonPeak * 0.4, noonPeak, sp)
+  } else if (t < 0.70) {
+    // Descend from zenith
+    const p = (t - 0.50) / 0.20
+    const sp = p * p * (3 - 2 * p)
+    elevation = THREE.MathUtils.lerp(noonPeak, noonPeak * 0.4, sp)
+  } else if (t < 0.85) {
+    // Sunset: above horizon → below
+    const p = (t - 0.70) / 0.15
+    const sp = p * p * (3 - 2 * p)
+    elevation = THREE.MathUtils.lerp(noonPeak * 0.4, nightLow, sp)
+  } else {
+    elevation = nightLow
+  }
+
+  // Azimuth: continuous full-circle sweep — east(π/2) → south(π) → west(3π/2)
+  // At t=0.25 (dawn):  az = π/2 → sun in east (+x)
+  // At t=0.50 (noon):  az = π   → sun in south (+z)
+  // At t=0.75 (dusk):  az = 3π/2 → sun in west (-x)
+  const azimuth = t * 2 * Math.PI
+
+  uSunDir.value.set(
+    Math.cos(elevation) * Math.sin(azimuth),
+    Math.sin(elevation),
+    -Math.cos(elevation) * Math.cos(azimuth)
+  )
+
+  // Night factor: 1=full night (moon visible), 0=full day
+  let nightFactor
+  if (t < 0.15) {
+    nightFactor = 1.0
+  } else if (t < 0.30) {
+    // Night → Day
+    nightFactor = 1.0 - (t - 0.15) / 0.15
+  } else if (t < 0.70) {
+    nightFactor = 0
+  } else if (t < 0.85) {
+    // Day → Night
+    nightFactor = (t - 0.70) / 0.15
+  } else {
+    nightFactor = 1.0
+  }
+  uNightFactor.value = nightFactor
+
+  // Smoothstep the palette interpolation for natural transitions
+  const sw = w * w * (3 - 2 * w)
+
+  uZenithColor.value.copy(paletteA.zenith).lerp(paletteB.zenith, sw)
+  uHorizonColor.value.copy(paletteA.horizon).lerp(paletteB.horizon, sw)
+  uDeepColor.value.copy(paletteA.deep).lerp(paletteB.deep, sw)
+  uShallowColor.value.copy(paletteA.shallow).lerp(paletteB.shallow, sw)
+  const intensity = THREE.MathUtils.lerp(paletteA.intensity, paletteB.intensity, sw)
+  uSunColor.value.copy(paletteA.sun).lerp(paletteB.sun, sw).multiplyScalar(intensity)
+
+  timeLabel.value = getTimeLabel(t)
+  updateTimeMark(t)
+}
+
+/** Sync time-of-day slider with the current system clock */
+function syncTimeWithSystem() {
+  const now = new Date()
+  const sec = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds()
+  const t = sec / 86400  // 0.0 (midnight) → 1.0 (next midnight)
+  timeSliderValue.value = Math.round(t * 100)
+  updateDateText(now)
+  applyTimeOfDay(t)
+}
+
+/* ---------------------------------------------------------------------------
+   Controls handlers
+   --------------------------------------------------------------------------- */
+function onSeaStateChange(e) {
+  const val = Number(e.target.value)
+  seaSliderValue.value = val
+  targetSeaSlider = val
+  uSeaUniform.value = 0.25 + (val / 100) * 1.5
+  seaValue.value = uSeaUniform.value.toFixed(2)
+}
+
+function onTimeOfDayChange(e) {
+  const val = Number(e.target.value)
+  timeSliderValue.value = val
+  realTimeMode.value = false
+  if (demoMode.value) {
+    demoHour = (val / 100) * 24
+    demoPrevHour = demoHour
+  }
+  applyTimeOfDay(val / 100)
+}
+
+function toggleDrift() {
+  driftEnabled.value = !driftEnabled.value
+  if (controls) {
+    controls.autoRotate = driftEnabled.value
+  }
+}
+
+function toggleUltraHd() {
+  PERF.toggleUltraHd()
+}
+
+function toggleLang() {
+  currentLang.value = currentLang.value === 'en' ? 'zh' : 'en'
+  PERF.updateQualityBadge()
+  applyTimeOfDay(timeSliderValue.value / 100)
+}
+
+function onToggleRealTime() {
+  if (demoMode.value) {
+    demoMode.value = false
+    demoDate = new Date()
+    updateDateText(demoDate)
+  }
+  realTimeMode.value = !realTimeMode.value
+  if (realTimeMode.value) syncTimeWithSystem()
+}
+
+/* ---------------------------------------------------------------------------
+   Camera reset
+   --------------------------------------------------------------------------- */
+
+/** 鱼缸水平中心（虚拟鱼缸 XZ 中心为原点） */
+const AQUARIUM_CENTER = new THREE.Vector3(0, 1.5, 0)
+const AQUARIUM_VIEW_DIST = 18
+
+/**
+ * 计算重置/初始相机位姿：
+ * 相机放在鱼缸中心的反方向、沿海平面高度，使面朝太阳（白天）/月亮（夜晚）
+ * 水平方位时，鱼缸中心恰好在前方视野中，可环绕观看。
+ */
+function computeResetPose() {
+  const sunDir = uSunDir.value.clone()
+  // 月亮大致在太阳对侧（与天空着色器一致，略上倾 0.15）
+  const moonDir = sunDir.clone().negate()
+  moonDir.y += 0.15
+  moonDir.normalize()
+  // 白天 0 → 太阳方向，夜晚 1 → 月亮方向，按夜晚因子平滑过渡
+  const dir = sunDir.lerp(moonDir, uNightFactor.value)
+  dir.y = 0 // 只保留海平面水平方向
+  if (dir.lengthSq() < 0.000001) dir.set(0, 0, -1)
+  dir.normalize()
+
+  // 相机位于鱼缸中心的反方向（-dir × 距离），海平面高度
+  const pos = AQUARIUM_CENTER.clone()
+    .addScaledVector(dir, -AQUARIUM_VIEW_DIST)
+  pos.y = 5.5
+  return { pos, target: AQUARIUM_CENTER.clone() }
+}
+
+function onResetCamera() {
+  const pose = computeResetPose()
+  camera.position.copy(pose.pos)
+  camera.up.set(0, 1, 0)
+  controls.target.copy(pose.target)
+  controls.update()
+  if (fishSystem.value?.cameraRig.active) {
+    fishSystem.value.cameraRig.exit()
+  }
+}
+
+function onToggleFishCam() {
+  if (!fishSystem.value?.ready) return
+  if (fishSystem.value.cameraRig.active) {
+    fishSystem.value.cameraRig.exit()
+    // Keep camera fixed at current position, update orbit target ahead
+    const dir = new THREE.Vector3()
+    camera.getWorldDirection(dir)
+    controls.target.copy(camera.position).add(dir.multiplyScalar(5))
+    controls.update()
+  } else {
+    const fish = fishSystem.value.getRandomFish()
+    fishSystem.value.cameraRig.enter(fish)
+  }
+}
+
+function onTogglePlay(playing) {
+  simPaused.value = !playing
+}
+
+function onUpdateSpeed(val) {
+  simSpeed.value = val
+  targetSpeed = val
+}
+
+/* ---------------------------------------------------------------------------
+   Meteor control（轨迹模式配置，辐射点模式实时生效）
+   --------------------------------------------------------------------------- */
+function ensureMeteor() {
+  if (meteorSystem) return Promise.resolve(meteorSystem)
+  if (!scene || !camera) return Promise.resolve(null)
+  if (!meteorLoadPromise) {
+    meteorLoadPromise = import('./weather/meteor.js').then(({ createMeteorSystem }) => {
+      if (disposed) return null
+      if (!meteorSystem && scene && camera) {
+        meteorSystem = createMeteorSystem(scene, camera, meteorCfg.value)
+      }
+      return meteorSystem
+    })
+  }
+  return meteorLoadPromise
+}
+
+function ensureWeather() {
+  if (weatherSystem.value) return Promise.resolve(weatherSystem.value)
+  if (!scene) return Promise.resolve(null)
+  if (!weatherLoadPromise) {
+    weatherLoadPromise = import('./weather/weather-system.js').then(({ createWeatherSystem }) => {
+      if (disposed) return null
+      if (!weatherSystem.value && scene) {
+        weatherSystem.value = createWeatherSystem(scene, {
+          camera,
+          lightningUniform: uLightning,
+          lightningDirUniform: uLightningDir,
+        })
+        weatherSystem.value.setLightningFlash(lightningFlash.value / 100)
+      }
+      return weatherSystem.value
+    })
+  }
+  return weatherLoadPromise
+}
+
+function onMeteorMode(mode) {
+  meteorCfg.value.mode = mode
+  ensureMeteor().then((m) => m?.setConfig({ mode }))
+}
+
+function onMeteorCfg(key, val) {
+  meteorCfg.value[key] = val
+  ensureMeteor().then((m) => m?.setConfig({ [key]: val }))
+}
+
+/** 手动触发一场流星雨（辐射模式）/ 一颗流星（随机模式） */
+function onMeteorShower() {
+  if (weatherType.value === 0 && uNightFactor.value > 0.55) {
+    ensureMeteor().then((m) => m?.trigger())
+  }
+}
+
+function onAquariumSizeChange(e) {
+  const val = Number(e.target.value)
+  aquariumSize.value = val
+  if (fishSystem.value) fishSystem.value.resizeAquarium(val)
+}
+
+function toggleBoundary() {
+  showBoundary.value = !showBoundary.value
+  if (fishSystem.value) fishSystem.value.toggleBoundary(showBoundary.value)
+}
+
+// 风暴模式：进入拉满海况 + 2.0x 速度，离开恢复；通过 target 值在帧循环中平滑过渡
+let stormActive = false
+let stormPrevSeaSlider = 45
+let stormPrevSpeed = 1
+let targetSeaSlider = 45
+let targetSpeed = 1
+
+function setWeatherType(val) {
+  const nextType = ['clear', 'snow', 'rain', 'storm'][val]
+  const isStorm = nextType === 'storm'
+
+  if (isStorm && !stormActive) {
+    stormPrevSeaSlider = seaSliderValue.value
+    stormPrevSpeed = simSpeed.value
+    targetSeaSlider = 100
+    targetSpeed = 2
+  } else if (!isStorm && stormActive) {
+    targetSeaSlider = stormPrevSeaSlider
+    targetSpeed = stormPrevSpeed
+  }
+
+  stormActive = isStorm
+  weatherType.value = val
+  ensureWeather().then((sys) => {
+    sys?.setLightningFlash(lightningFlash.value / 100)
+    sys?.setWeather(nextType)
+  })
+}
+
+function onWeatherChange(e) {
+  setWeatherType(Number(e.target.value))
+}
+
+function onLightningFlashChange(e) {
+  const val = Number(e.target.value)
+  lightningFlash.value = val
+  weatherSystem.value?.setLightningFlash(val / 100)
+}
+
+/* ---------------------------------------------------------------------------
+   Fish controls handlers
+   --------------------------------------------------------------------------- */
+function onFishControl(key, e) {
+  const val = Number(e.target.value)
+  if (!fishSystem.value) return
+  fishDisplay.value[key] = val
+  const ctrl = fishSystem.value.controls
+  switch (key) {
+    case 'sardineCount': fishSystem.value.onSardineCountChange(val); break
+    case 'koiCount': fishSystem.value.onKoiCountChange(val); break
+    default:
+      if (key in ctrl) {
+        ctrl[key].value = val
+        fishSystem.value.onControlChange()
+      }
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Animation
+   --------------------------------------------------------------------------- */
+function scheduleSecondarySystems() {
+  if (secondaryScheduled || disposed || !scene) return
+  secondaryScheduled = true
+  requestAnimationFrame(async () => {
+    if (disposed || !scene) return
+    const { createFishSystem } = await import('./fish/index.js')
+    if (disposed || !scene) return
+    fishSystem.value = createFishSystem({
+      scene,
+      controls,
+      aquariumSize: aquariumSize.value,
+      showBoundary: showBoundary.value,
+    })
+    fishCamActive.value = false
+    fishModelKeys.value = fishSystem.value.modelKeys
+    setTimeout(() => {
+      if (disposed) return
+      if (fishSystem.value?.loadError) {
+        fishLoadError.value = fishSystem.value.loadError
+        setTimeout(() => { fishLoadError.value = '' }, 6000)
+      }
+    }, 3000)
+
+    if (uNightFactor.value > 0.5) ensureMeteor()
+  })
+}
+
+function revealUI() {
+  if (revealed) return
+  revealed = true
+  if (renderer?.domElement) renderer.domElement.style.opacity = '1'
+  emit('ready')
+  scheduleSecondarySystems()
+}
+
+async function frame() {
+  const now = performance.now()
+  const rawDt = (now - lastNow) / 1000
+  lastNow = now
+  const dt = Math.min(rawDt, 0.1)
+
+  // 风暴海况平滑过渡（指数缓动，约 1s 到达目标）
+  if (Math.abs(seaSliderValue.value - targetSeaSlider) > 0.05) {
+    const seaRate = 1 - Math.exp(-3 * dt)
+    seaSliderValue.value += (targetSeaSlider - seaSliderValue.value) * seaRate
+    uSeaUniform.value = 0.25 + (seaSliderValue.value / 100) * 1.5
+    seaValue.value = uSeaUniform.value.toFixed(2)
+  }
+  // 风暴速度平滑过渡
+  if (Math.abs(simSpeed.value - targetSpeed) > 0.005) {
+    const speedRate = 1 - Math.exp(-2.5 * dt)
+    simSpeed.value += (targetSpeed - simSpeed.value) * speedRate
+  }
+
+  // Sync with system clock when real-time mode is active (~1s interval)
+  if (demoMode.value && !simPaused.value) {
+    advanceDemo(dt)
+  } else if (realTimeMode.value && rawDt < 0.15) {
+    if (now - lastRealTimeSync > 1000) {
+      lastRealTimeSync = now
+      syncTimeWithSystem()
+    }
+  }
+
+  // Advance ocean and fish simulation (paused when simPaused)
+  if (!simPaused.value) {
+    uTime.value += dt * simSpeed.value
+
+    // Update fish simulation and switch camera if needed
+    if (fishSystem.value?.ready) {
+      fishSystem.value.update(dt)
+      fishSystem.value.updateLights(uSunDir.value, uSunColor.value)
+      fishCamActive.value = fishSystem.value.cameraRig.active
+      if (fishCamActive.value) {
+        controls.enabled = false
+        const fishCam = fishSystem.value.cameraRig.activeCamera
+        camera.position.copy(fishCam.position)
+        camera.quaternion.copy(fishCam.quaternion)
+        camera.up.copy(fishCam.up)
+        camera.aspect = containerRef.value.clientWidth / containerRef.value.clientHeight
+        camera.updateProjectionMatrix()
+      } else {
+        controls.enabled = true
+      }
+    }
+    weatherSystem.value?.update(dt)
+    const nightClear = weatherType.value === 0 && uNightFactor.value > 0.55
+    if (meteorSystem) nightClear ? meteorSystem.update(dt) : meteorSystem.reset()
+  }
+
+  // Track fish model download progress and ready state
+  if (fishSystem.value) {
+    fishReady.value = fishSystem.value.ready
+    if (!fishSystem.value.ready) {
+      fishLoadProgress.value = fishSystem.value.loadProgress
+    } else if (fishLoadProgress.value < 1) {
+      fishLoadProgress.value = 1
+    }
+  }
+
+  PERF.tick(dt)
+  controls.update()
+  await postProcessing.renderAsync()
+  fpsAccum += dt
+  fpsCount += 1
+  if (fpsAccum >= 0.5) {
+    if (!PERF.benchPhase) {
+      fpsDisplay.value = String(Math.round(fpsCount / fpsAccum))
+    }
+    fpsAccum = 0
+    fpsCount = 0
+  }
+  if (!revealed) revealUI()
+  PERF.updateQualityBadge()
+}
+
+/* ---------------------------------------------------------------------------
+   Init
+   --------------------------------------------------------------------------- */
+async function init() {
+  if (!('gpu' in navigator) || !navigator.gpu) {
+    console.error('[OpenSea] WebGPU unavailable')
+    emit('error', '当前浏览器不支持 WebGPU，请使用 Chrome / Edge 113+')
+    return
+  }
+  try {
+    emitProgress(0.22, '检测 GPU…')
+    await nextTick()
+    PERF.tier = await PERF.pickInitialTier()
+    if (disposed) return
+    PERF.prevTier = PERF.tier
+    PERF.benchTier = PERF.tier
+    PERF.initPixelRatio()
+    uFbmOctaves.value = PERF.cfg.fbm
+
+    emitProgress(0.32, '初始化 WebGPU…')
+    await yieldToMain()
+    if (disposed || !containerRef.value) return
+
+    renderer = new THREE.WebGPURenderer({ antialias: true, powerPreference: 'high-performance' })
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+    renderer.setSize(containerRef.value.clientWidth, containerRef.value.clientHeight)
+    renderer.toneMapping = THREE.ACESFilmicToneMapping
+    renderer.toneMappingExposure = 1.0
+    renderer.domElement.style.opacity = '0'
+    renderer.domElement.style.transition = 'opacity 0.7s ease'
+    containerRef.value.appendChild(renderer.domElement)
+
+    scene = new THREE.Scene()
+    scene.background = new THREE.Color('#05070a')
+
+    camera = new THREE.PerspectiveCamera(55, containerRef.value.clientWidth / containerRef.value.clientHeight, 0.5, 8000)
+    camera.position.set(0, 5.5, 17)
+
+    emitProgress(0.48, '生成海洋…')
+    await yieldToMain()
+    if (disposed) return
+    PERF.rebuildOceanMesh(PERF.cfg)
+
+    emitProgress(0.58, '构建天空…')
+    await yieldToMain()
+    if (disposed) return
+    PERF.rebuildSkyDome(PERF.cfg)
+
+    postProcessing = new THREE.PostProcessing(renderer)
+    PERF.rebuildPostProcessing(PERF.cfg)
+
+    controls = new OrbitControls(camera, renderer.domElement)
+    controls.enableDamping = true
+    controls.dampingFactor = 0.06
+    controls.minDistance = 4
+    controls.maxDistance = 120
+    controls.minPolarAngle = 0.15
+    controls.maxPolarAngle = Math.PI * 0.495
+    controls.target.set(0, 1.5, 0)
+    controls.autoRotate = driftEnabled.value
+    controls.autoRotateSpeed = 0.25
+    controls.update()
+
+    // Space key → toggle fish cam
+    onSpaceKey = (e) => {
+      if (e.code !== 'Space' || e.repeat) return
+      e.preventDefault()
+      onToggleFishCam()
+    }
+    window.addEventListener('keydown', onSpaceKey)
+
+    // M key → 手动触发流星（仅 Clear 晴朗夜晚，可连续触发）
+    onMeteorKey = (e) => {
+      if (e.code !== 'KeyM' || e.repeat) return
+      if (weatherType.value === 0 && uNightFactor.value > 0.55) {
+        ensureMeteor().then((m) => m?.trigger())
+      }
+    }
+    window.addEventListener('keydown', onMeteorKey)
+
+    // L key → 手动触发闪电（仅 Storm 风暴天气，可连按）
+    onLightningKey = (e) => {
+      if (e.code !== 'KeyL' || e.repeat) return
+      if (weatherType.value === 3) {
+        ensureWeather().then((sys) => sys?.triggerLightning())
+      }
+    }
+    window.addEventListener('keydown', onLightningKey)
+
+    window.addEventListener('resize', onResize)
+    document.addEventListener('visibilitychange', onVisibilityChange)
+
+    applyTimeOfDay(0.55)
+    syncTimeWithSystem()
+
+    // 初始相机朝向太阳/月亮且正对鱼缸中心（可环绕观看）
+    const initialPose = computeResetPose()
+    camera.position.copy(initialPose.pos)
+    controls.target.copy(initialPose.target)
+    controls.update()
+    initialCamState.pos.copy(initialPose.pos)
+    initialCamState.target.copy(initialPose.target)
+
+    emitProgress(0.78, '编译着色器…')
+    await yieldToMain()
+    if (disposed) return
+    await renderer.init()
+    if (disposed) {
+      renderer.setAnimationLoop(null)
+      return
+    }
+
+    emitProgress(0.92, '即将就绪…')
+    lastNow = performance.now()
+    renderer.setAnimationLoop(frame)
+  } catch (err) {
+    console.error('[OpenSea] initialization failed:', err)
+    emit('error', '场景初始化失败，请刷新重试')
+  }
+}
+
+function onResize() {
+  if (!camera || !renderer) return
+  const w = containerRef.value.clientWidth
+  const h = containerRef.value.clientHeight
+  camera.aspect = w / h
+  camera.updateProjectionMatrix()
+  PERF.applyPixelRatio(PERF.cfg)
+  renderer.setSize(w, h)
+  if (fishSystem.value) fishSystem.value.resize(w, h)
+}
+
+function onVisibilityChange() {
+  if (!renderer) return
+  if (document.hidden) {
+    renderer.setAnimationLoop(null)
+  } else {
+    lastNow = performance.now()
+    renderer.setAnimationLoop(frame)
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Lifecycle
+   --------------------------------------------------------------------------- */
+onMounted(() => {
+  init()
+})
+
+onBeforeUnmount(() => {
+  disposed = true
+  if (renderer) {
+    renderer.setAnimationLoop(null)
+  }
+  fishSystem.value?.dispose()
+  weatherSystem.value?.dispose()
+  meteorSystem?.dispose()
+  if (onSpaceKey) window.removeEventListener('keydown', onSpaceKey)
+  if (onMeteorKey) window.removeEventListener('keydown', onMeteorKey)
+  if (onLightningKey) window.removeEventListener('keydown', onLightningKey)
+  window.removeEventListener('resize', onResize)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+  controls?.dispose()
+  if (window.__ocean) {
+    window.__ocean.geometry.dispose()
+    scene?.remove(window.__ocean)
+  }
+  if (window.__sky) {
+    window.__sky.geometry.dispose()
+    scene?.remove(window.__sky)
+  }
+  if (renderer?.domElement?.parentNode) {
+    renderer.domElement.parentNode.removeChild(renderer.domElement)
+  }
+  renderer?.dispose()
+})
+</script>
+
+<template>
+  <div ref="containerRef" class="open-sea-container">
+    <!-- Vignette overlay -->
+    <div class="vignette" aria-hidden="true"></div>
+
+    <!-- Fish load error toast -->
+    <div v-if="fishLoadError" class="error-toast">{{ fishLoadError }}</div>
+
+    <div v-if="showTimeMark" class="ui time-mark" aria-hidden="true">
+      <span>{{ phaseText }}</span>
+      <output class="clock">{{ clockText }}</output>
+      <span>{{ dateText }}</span>
+    </div>
+
+    <SeaDock
+      :t="t"
+      :current-lang="currentLang"
+      :sea-value="seaValue"
+      :sea-slider-value="seaSliderValue"
+      :drift-enabled="driftEnabled"
+      :time-label="timeLabel"
+      :time-slider-value="timeSliderValue"
+      :real-time-mode="realTimeMode"
+      :demo-mode="demoMode"
+      :show-time-mark="showTimeMark"
+      :weather-type="weatherType"
+      :weather-labels="weatherLabels"
+      :lightning-flash="lightningFlash"
+      :aquarium-size="aquariumSize"
+      :show-boundary="showBoundary"
+      :fish-ready="fishReady"
+      :fish-load-progress="fishLoadProgress"
+      :fish-model-keys="fishModelKeys"
+      :fish-display="fishDisplay"
+      :meteor-cfg="meteorCfg"
+      :fps="fpsDisplay"
+      :quality-badge="qualityBadge"
+      :quality-label="qualityLabel"
+      :fish-cam-active="fishCamActive"
+      :ultra-hd="PERF?.ultraHd ?? false"
+      :playing="!simPaused"
+      :sim-speed="simSpeed"
+      @toggle-lang="toggleLang"
+      @sea-state="onSeaStateChange"
+      @toggle-drift="toggleDrift"
+      @time-of-day="onTimeOfDayChange"
+      @toggle-real-time="onToggleRealTime"
+      @toggle-demo="toggleDemoMode"
+      @toggle-time-mark="toggleTimeMark"
+      @weather="onWeatherChange"
+      @lightning-flash="onLightningFlashChange"
+      @aquarium-size="onAquariumSizeChange"
+      @toggle-boundary="toggleBoundary"
+      @fish-control="onFishControl"
+      @meteor-mode="onMeteorMode"
+      @meteor-cfg="onMeteorCfg"
+      @meteor-shower="onMeteorShower"
+      @toggle-play="onTogglePlay"
+      @update-speed="onUpdateSpeed"
+      @toggle-ultra-hd="toggleUltraHd"
+      @reset-camera="onResetCamera"
+      @toggle-fish-cam="onToggleFishCam"
+    />
+
+  </div>
+</template>
+
+<style scoped>
+.open-sea-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #05070a;
+}
+
+.open-sea-container :deep(canvas) {
+  position: absolute;
+  inset: 0;
+  display: block;
+  touch-action: none;
+}
+
+.vignette {
+  position: fixed;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 130% 95% at 50% 38%, transparent 52%, rgba(2, 4, 7, 0.55) 100%),
+    linear-gradient(to bottom, transparent 68%, rgba(2, 4, 7, 0.38) 100%);
+}
+
+.error-toast {
+  position: fixed;
+  bottom: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 100;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  padding: 10px 22px;
+  border-radius: 8px;
+  background: rgba(233, 115, 106, 0.88);
+  backdrop-filter: blur(8px);
+  color: #fff;
+  white-space: nowrap;
+}
+</style>
