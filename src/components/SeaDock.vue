@@ -27,6 +27,7 @@ const props = defineProps({
   skeletalCount: { type: Number, default: 20 },
   skeletalCountMax: { type: Number, default: 96 },
   recommendedSkeletalCount: { type: Number, default: 20 },
+  whaleEnabled: { type: Boolean, default: true },
   meteorCfg: { type: Object, required: true },
   fps: { type: [Number, String], default: '--' },
   qualityBadge: { type: String, default: '' },
@@ -51,6 +52,7 @@ const emit = defineEmits([
   'toggleBoundary',
   'fishControl',
   'toggleSkeletalAnim',
+  'toggleWhale',
   'meteorMode',
   'meteorCfg',
   'meteorShower',
@@ -259,6 +261,14 @@ onBeforeUnmount(() => {
               <output>{{ skeletalCount }}</output>
             </label>
             <p class="help-text" style="margin:-2px 0 10px;">{{ t('fish.skeletalAnimHelp').replace('{cap}', String(skeletalCountMax)) }}</p>
+
+            <label class="field-row with-toggle" style="margin-bottom:8px;">
+              <span>{{ t('fish.whale') }}</span>
+              <button type="button" class="pill" :class="{ active: whaleEnabled }" :disabled="!fishReady"
+                @click="emit('toggleWhale')">{{ whaleEnabled ? 'ON' : 'OFF' }}</button>
+              <output style="font-size:10px;opacity:.7;">巡游</output>
+            </label>
+            <p class="help-text" style="margin:-4px 0 10px;">{{ t('fish.whaleHelp') }}</p>
 
             <div class="group-label">沙丁鱼</div>
             <label class="field-row">

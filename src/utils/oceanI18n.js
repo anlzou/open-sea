@@ -46,6 +46,8 @@ export const L10N = {
     'fish.skeletalAnim': 'Bone Anim',
     'fish.skeletalAnimHelp': 'Auto default from GPU tier; slider sets skinned count (max {cap}). Extra fish use curve deform.',
     'fish.skeletalCount': 'Animated Fish',
+    'fish.whale': 'Whale',
+    'fish.whaleHelp': 'Outside tank, CCW · Swim/Turn · breach at side centers',
     'panel.aquariumSize': 'Aquarium Size',
     'panel.showBoundary': 'Show Boundary',
   },
@@ -93,6 +95,8 @@ export const L10N = {
     'fish.skeletalAnim': '骨骼动画',
     'fish.skeletalAnimHelp': '按画质档位自动默认；滑条调整蒙皮数量（上限 {cap}）。超出用曲线摆尾。',
     'fish.skeletalCount': '动画鱼数量',
+    'fish.whale': '鲸鱼',
+    'fish.whaleHelp': '鱼缸外侧逆时针巡游 · Swim/Turn · 四面中点跃出',
     'panel.aquariumSize': '鱼缸大小',
     'panel.showBoundary': '显示边框',
   }

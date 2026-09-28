@@ -78,6 +78,7 @@ const skeletalSoftCap = ref(96)
 const skeletalCount = ref(20)
 const skeletalCountMax = ref(96)
 const recommendedSkeletalCount = ref(20)
+const whaleEnabled = ref(true)
 
 // Weather system state
 const weatherSystem = ref(null)
@@ -871,6 +872,11 @@ function toggleSkeletalAnim() {
   if (fishSystem.value) fishSystem.value.onSkeletalAnimChange(skeletalAnim.value)
 }
 
+function toggleWhale() {
+  whaleEnabled.value = !whaleEnabled.value
+  if (fishSystem.value) fishSystem.value.onWhaleChange(whaleEnabled.value)
+}
+
 // 风暴模式：进入拉满海况 + 2.0x 速度，离开恢复；通过 target 值在帧循环中平滑过渡
 let stormActive = false
 let stormPrevSeaSlider = 45
@@ -951,6 +957,7 @@ function scheduleSecondarySystems() {
       showBoundary: showBoundary.value,
       enableSkeletalAnim: skeletalAnim.value,
       qualityTier: PERF?.tier ?? 2,
+      enableWhale: whaleEnabled.value,
     })
     fishCamActive.value = false
     fishModelKeys.value = fishSystem.value.modelKeys
@@ -1297,6 +1304,7 @@ onBeforeUnmount(() => {
       :skeletal-count="skeletalCount"
       :skeletal-count-max="skeletalCountMax"
       :recommended-skeletal-count="recommendedSkeletalCount"
+      :whale-enabled="whaleEnabled"
       :meteor-cfg="meteorCfg"
       :fps="fpsDisplay"
       :quality-badge="qualityBadge"
@@ -1317,6 +1325,7 @@ onBeforeUnmount(() => {
       @aquarium-size="onAquariumSizeChange"
       @toggle-boundary="toggleBoundary"
       @toggle-skeletal-anim="toggleSkeletalAnim"
+      @toggle-whale="toggleWhale"
       @fish-control="onFishControl"
       @meteor-mode="onMeteorMode"
       @meteor-cfg="onMeteorCfg"

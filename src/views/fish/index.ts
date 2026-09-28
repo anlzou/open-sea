@@ -16,6 +16,7 @@ import { loadFishModel, isReady, getLoadError, getLoadProgress, getModelKeys } f
 import { createCameraRig } from './camera-rig.js'
 import { createDefaultSettings, obstacles, virtualAquarium, setAquariumSize } from './config.js'
 import { recommendSkeletalFishCount } from './perf-budget.js'
+import { createWhaleSystem, type WhaleSystem } from './whale.js'
 import type { FishState } from './types.js'
 
 export interface FishSystemOptions {
@@ -31,6 +32,8 @@ export interface FishSystemOptions {
   qualityTier?: number
   /** Override auto-recommended skeletal fish count */
   skeletalCount?: number
+  /** Show the perimeter whale (default true) */
+  enableWhale?: boolean
 }
 
 export interface FishControls {
@@ -52,6 +55,7 @@ export interface FishControls {
   enableSkeletalAnim: { value: boolean }
   /** How many fish use bone clips (0…HARD_MAX); rest fall back to curve deform */
   skeletalCount: { value: number; min: number; max: number }
+  enableWhale: { value: boolean }
 }
 
 export interface FishSystem {
@@ -75,6 +79,7 @@ export interface FishSystem {
   onKoiCountChange(value: number): void
   onSkeletalAnimChange(enabled: boolean): void
   onSkeletalCountChange(value: number): void
+  onWhaleChange(enabled: boolean): void
 }
 
 export function createFishSystem(options: FishSystemOptions): FishSystem {
@@ -88,6 +93,7 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
     skeletalCount: initSkeletalCount,
     sardineCount: initSardineCount,
     koiCount: initKoiCount,
+    enableWhale: initWhale = true,
   } = options
 
   const recommendedSkeletalCount = recommendSkeletalFishCount(qualityTier)
@@ -98,6 +104,14 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
       initSkeletalCount ?? recommendedSkeletalCount,
     ),
   )
+
+  let whale: WhaleSystem | null = null
+  try {
+    whale = createWhaleSystem(scene)
+    whale.setEnabled(initWhale)
+  } catch (err) {
+    console.warn('Whale system init failed', err)
+  }
 
   // ---- Simulation setup ----
   const sardineSettings = createDefaultSettings()
@@ -164,6 +178,7 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
     koiSpeed: { value: 1.0, min: 0.2, max: 2.0, step: 0.05 },
     enableSkeletalAnim: { value: initSkeletal },
     skeletalCount: { value: initialAnimated, min: 0, max: SKELETAL_ANIM_HARD_MAX },
+    enableWhale: { value: initWhale },
   }
 
   function skeletalBudget(): number {
@@ -296,6 +311,11 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
     syncRenderMode()
   }
 
+  function onWhaleChange(enabled: boolean) {
+    controls.enableWhale.value = enabled
+    whale?.setEnabled(enabled)
+  }
+
   // ------- Visual boundary wireframe -------
   const boundaryGroup = new THREE.Group()
   boundaryGroup.renderOrder = -1
@@ -371,6 +391,7 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
     // Apply initial aquarium size and boundary visibility
     if (initSize && initSize !== 100) {
       setAquariumSize(initSize)
+      whale?.resizePath()
     }
     buildMeshes()
     rebuildBoundary()
@@ -389,6 +410,7 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
     koiSim.reset(koiSim.fish.length, 142)
     syncRenderMode()
     rebuildBoundary()
+    whale?.resizePath()
   }
 
   function toggleBoundary(show: boolean) {
@@ -404,6 +426,7 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
 
     sardineSim.update(simDt)
     koiSim.update(simDt)
+    whale?.update(simDt)
 
     const skeletal = controls.enableSkeletalAnim.value
     if (skeletal) {
@@ -444,6 +467,7 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
     disposeFishMesh(koiMesh)
     sardineSkinned?.dispose()
     koiSkinned?.dispose()
+    whale?.dispose()
     scene.remove(ambientLight)
     scene.remove(hemiLight)
     scene.remove(fishSunLight)
@@ -470,5 +494,6 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
     onKoiCountChange,
     onSkeletalAnimChange,
     onSkeletalCountChange,
+    onWhaleChange,
   }
 }
