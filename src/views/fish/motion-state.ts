@@ -24,6 +24,7 @@ export function createFishMotionState(index = 0): FishMotionState {
     swimAccelerationTime: 0,
     swimAccelerationArmed: true,
     bank: 0,
+    turnBias: 0,
     curveBendWorld: new THREE.Vector3(),
   }
 }
@@ -43,6 +44,7 @@ export function updateFishMotionState(
 
   if (previousDirection.lengthSq() <= 0.000001 || nextDirection.lengthSq() <= 0.000001) {
     fish.bank = dampAngle(fish.bank ?? 0, 0, fishConfig.bankResponse, dt)
+    fish.turnBias = dampAngle(fish.turnBias ?? 0, 0, fishConfig.bankResponse, dt)
     dampCurveBend(fish, null, dt, scratch)
     updateSwimPhase(fish, currentSpeed, speed, dt)
     return
@@ -63,6 +65,11 @@ export function updateFishMotionState(
     fishConfig.maxBankAngle,
   )
   fish.bank = dampAngle(fish.bank ?? 0, targetBank, fishConfig.bankResponse, dt)
+
+  // +1 left (CCW from above), -1 right — used by skeletal TurnLeft / TurnRight
+  const yawSense = 2.2 // rad/s → full bias
+  const targetBias = THREE.MathUtils.clamp(turnSign * (turnRate / yawSense), -1, 1)
+  fish.turnBias = dampAngle(fish.turnBias ?? 0, targetBias, fishConfig.bankResponse, dt)
 }
 
 function updateSwimPhase(fish: FishState, currentSpeed: number, nextSpeed: number, dt: number): void {

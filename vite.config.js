@@ -6,6 +6,9 @@ import vue from '@vitejs/plugin-vue'
 export default defineConfig(({ command }) => ({
   plugins: [vue()],
   base: command === 'build' ? '/open-sea/' : '/',
+  server: {
+    host: true, // 0.0.0.0 — allow LAN access (e.g. http://192.168.x.x:5173)
+  },
   build: {
     rollupOptions: {
       output: {

@@ -88,13 +88,23 @@ export function updateFishInstances(
   mesh: THREE.InstancedMesh | null,
   fish: FishState[],
 ): void {
+  updateFishInstancesRange(mesh, fish, 0, fish.length)
+}
+
+/** Write instance matrices for fish[start .. start+count). Instance slot i maps to fish[start+i]. */
+export function updateFishInstancesRange(
+  mesh: THREE.InstancedMesh | null,
+  fish: FishState[],
+  start: number,
+  count: number,
+): void {
   if (!mesh) return
   const curveAttributes = readFishCurveAttributes(mesh.geometry)
   const fishScale = fishConfig.renderScale * ((mesh as any).userData.renderScale ?? 1)
-  const count = Math.min(fish.length, mesh.count)
+  const n = Math.min(count, mesh.count, Math.max(0, fish.length - start))
 
-  for (let i = 0; i < count; i += 1) {
-    const currentFish: FishState | undefined = fish[i]
+  for (let i = 0; i < n; i += 1) {
+    const currentFish: FishState | undefined = fish[start + i]
     if (!currentFish) continue
     const direction = readFishDirection(currentFish, tmpDirection)
     writeFishOrientationQuaternion(currentFish, direction, tmpQuaternion)

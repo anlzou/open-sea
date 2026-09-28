@@ -7,6 +7,13 @@ import type { FishModelInstance } from './types.js'
 interface FishModelSource {
   key: string
   url: URL
+  /**
+   * Bake model local axes into extracted (instanced) geometry.
+   * fish.glb bind-pose mesh: length along +Z (nose +Z), height along +Y, width along +X.
+   * Pose system expects: nose +Y, dorsal +Z.
+   * Proper rotation: Rx(-90°) then Ry(180°) → (x,y,z) → (-x, z, y) roughly for nose/dorsal;
+   * Built below as a single Matrix4.
+   */
   axes: THREE.Matrix4
 }
 
@@ -17,11 +24,32 @@ interface FishModel {
   renderScale?: number
 }
 
+export interface AnimatedFishTemplate {
+  /** Original glTF scene — always clone via SkeletonUtils, never mutate */
+  scene: THREE.Object3D
+  animations: THREE.AnimationClip[]
+  normalizeScale: number
+  /** Offset applied on each clone so bbox center ≈ origin (model space) */
+  centerOffset: THREE.Vector3
+  /** Maps glTF nose +Z / up +Y → pose nose +Y / dorsal +Z */
+  orientQuaternion: THREE.Quaternion
+}
+
+/** Nose +Z, up +Y → nose +Y, dorsal +Z (Rx -90° · Ry 180°) */
+function createFishOrientMatrix(): THREE.Matrix4 {
+  const rx = new THREE.Matrix4().makeRotationX(-Math.PI / 2)
+  const ry = new THREE.Matrix4().makeRotationY(Math.PI)
+  return ry.multiply(rx)
+}
+
+const fishOrientMatrix = createFishOrientMatrix()
+const fishOrientQuaternion = new THREE.Quaternion().setFromRotationMatrix(fishOrientMatrix)
+
 const fishModelSources: FishModelSource[] = [
   {
-    key: 'cartoon',
-    url: new URL('./models/cartoon.glb', import.meta.url),
-    axes: new THREE.Matrix4().set(0, -1, 0, 0, -1, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1),
+    key: 'fish',
+    url: new URL('./models/fish.glb', import.meta.url),
+    axes: fishOrientMatrix.clone(),
   },
 ]
 
@@ -29,6 +57,7 @@ const tmpCenter = new THREE.Vector3()
 const tmpSize = new THREE.Vector3()
 
 let fishModels: FishModel[] = []
+let animatedTemplate: AnimatedFishTemplate | null = null
 let loadDone = false
 let loadError: string | null = null
 let loadProgress = 0
@@ -54,6 +83,11 @@ export function getModelKeys(): string[] {
   return fishModelSources.map((s) => s.key)
 }
 
+/** Shared skinned template + clips for optional skeletal animation path */
+export function getAnimatedFishTemplate(): AnimatedFishTemplate | null {
+  return animatedTemplate
+}
+
 export async function loadFishModel(): Promise<void> {
   if (loadPromise) return loadPromise
   loadPromise = _load()
@@ -75,15 +109,19 @@ async function _load(): Promise<void> {
       const src = fishModelSources[i]
       const r = results[i]
       if (r.status === 'fulfilled') {
-        loaded.push(createFishModelFromGltf(r.value, src))
+        const gltf = r.value
+        loaded.push(createFishModelFromGltf(gltf, src))
+        if (src.key === 'fish') {
+          animatedTemplate = createAnimatedTemplate(gltf, src)
+        }
       } else {
         console.warn(`Failed to load ${src.key} fish model (attempt ${attempt}/${MAX_RETRIES}).`, r.reason)
       }
     }
     if (loaded.length) {
       fishModels = loaded
-      const cartoon = loaded.find((m) => m.key === 'cartoon') ?? loaded[0]
-      fishModels.push(createKoiModelFromBase(cartoon))
+      const base = loaded.find((m) => m.key === 'fish') ?? loaded[0]
+      fishModels.push(createKoiModelFromBase(base))
       loadDone = true
       return
     }
@@ -120,7 +158,11 @@ function loadWithProgress(url: string): Promise<any> {
 
 function findPrimaryMesh(root: THREE.Object3D): THREE.Mesh | null {
   let result: THREE.Mesh | null = null
-  root.traverse((obj: THREE.Object3D) => { if (obj instanceof THREE.Mesh && obj.geometry && !result) result = obj })
+  root.traverse((obj: THREE.Object3D) => {
+    if ((obj instanceof THREE.Mesh || obj instanceof THREE.SkinnedMesh) && obj.geometry && !result) {
+      result = obj as THREE.Mesh
+    }
+  })
   return result
 }
 
@@ -129,11 +171,56 @@ function createFishModelFromGltf(gltf: any, src: FishModelSource): FishModel {
   scene.updateWorldMatrix(true, true)
   const mesh = findPrimaryMesh(scene)
   if (!mesh) throw new Error(`Fish model ${src.key} has no mesh.`)
+  // Bind-pose snapshot for InstancedMesh path (no skinning)
   return { key: src.key, geometry: createFishGeometry(mesh, src), material: cloneFishMaterial(mesh.material) }
 }
 
+/**
+ * Keep the original skinned scene as template (SkeletonUtils.clone only).
+ * Normalize metrics so body length ≈ fishConfig.length.
+ */
+function createAnimatedTemplate(gltf: any, _src: FishModelSource): AnimatedFishTemplate {
+  const scene = (gltf.scene ?? gltf) as THREE.Object3D
+  scene.updateWorldMatrix(true, true)
+
+  const box = new THREE.Box3().setFromObject(scene)
+  box.getCenter(tmpCenter)
+  box.getSize(tmpSize)
+  const maxDim = Math.max(tmpSize.x, tmpSize.y, tmpSize.z, 0.0001)
+  const normalizeScale = (fishConfig.length * 0.5) / maxDim
+
+  // Own materials so roughness/metalness match instanced path
+  prepareMaterials(scene)
+
+  const animations: THREE.AnimationClip[] = Array.isArray(gltf.animations)
+    ? gltf.animations.map((c: THREE.AnimationClip) => c.clone())
+    : []
+
+  return {
+    scene,
+    animations,
+    normalizeScale,
+    centerOffset: tmpCenter.clone().multiplyScalar(-1),
+    orientQuaternion: fishOrientQuaternion.clone(),
+  }
+}
+
+function prepareMaterials(root: THREE.Object3D): void {
+  root.traverse((obj) => {
+    if (!(obj instanceof THREE.Mesh) && !(obj instanceof THREE.SkinnedMesh)) return
+    const src = obj.material
+    if (Array.isArray(src)) {
+      obj.material = src.map((m) => cloneFishMaterial(m))
+    } else {
+      obj.material = cloneFishMaterial(src)
+    }
+    obj.castShadow = true
+    obj.receiveShadow = false
+  })
+}
+
 /* ================================================================
-   Koi — 基于 cartoon 几何体，烘焙白底红纹顶点色（保留原贴图含眼睛）
+   Koi — 基于 fish 几何体，烘焙白底红纹顶点色（保留原贴图含眼睛）
    ================================================================ */
 
 /**
@@ -212,7 +299,7 @@ function smoothPatch(x: number, y: number, centerX: number, centerY: number, rad
   return 1 - THREE.MathUtils.smoothstep(distance, radius * 0.58, radius)
 }
 
-/** 锦鲤材质：保留 cartoon 原贴图（含眼睛），叠加顶点色 */
+/** 锦鲤材质：保留 fish 原贴图（含眼睛），叠加顶点色 */
 function createKoiMaterial(baseMaterial: THREE.Material): THREE.Material {
   const material = cloneFishMaterial(baseMaterial) as THREE.MeshStandardMaterial
   material.color.setHex(0xffffff)
@@ -232,13 +319,20 @@ function createKoiModelFromBase(base: FishModel): FishModel {
    ================================================================ */
 
 function createFishGeometry(mesh: THREE.Mesh, src: FishModelSource): THREE.BufferGeometry {
+  // Prefer bind pose if skinned
   const geo = mesh.geometry.clone()
+  // Drop skinning attrs — InstancedMesh path uses curve-deformation shader instead
+  geo.deleteAttribute('skinIndex')
+  geo.deleteAttribute('skinWeight')
   geo.applyMatrix4(src.axes)
   geo.computeBoundingBox()
   const box = geo.boundingBox!
   box.getCenter(tmpCenter); box.getSize(tmpSize)
   const maxDim = Math.max(tmpSize.x, tmpSize.y, tmpSize.z)
-  if (maxDim > 0.0001) { geo.translate(-tmpCenter.x, -tmpCenter.y, -tmpCenter.z); geo.scale(1 / maxDim, 1 / maxDim, 1 / maxDim) }
+  if (maxDim > 0.0001) {
+    geo.translate(-tmpCenter.x, -tmpCenter.y, -tmpCenter.z)
+    geo.scale(1 / maxDim, 1 / maxDim, 1 / maxDim)
+  }
   geo.scale(fishConfig.length * 0.5, fishConfig.length * 0.5, fishConfig.length * 0.5)
   geo.computeVertexNormals()
   return geo
@@ -247,11 +341,12 @@ function createFishGeometry(mesh: THREE.Mesh, src: FishModelSource): THREE.Buffe
 function cloneFishMaterial(material: THREE.Material | THREE.Material[]): THREE.Material {
   const src = Array.isArray(material) ? material[0] : material
   const m = src.clone()
-  if ('roughness' in m) m.roughness = 1
-  if ('roughnessMap' in m) m.roughnessMap = undefined
-  if ('metalness' in m) m.metalness = 0
-  if ('metalnessMap' in m) m.metalnessMap = undefined
-  m.side = THREE.FrontSide; m.needsUpdate = true
+  if ('roughness' in m) (m as THREE.MeshStandardMaterial).roughness = 1
+  if ('roughnessMap' in m) (m as THREE.MeshStandardMaterial).roughnessMap = undefined
+  if ('metalness' in m) (m as THREE.MeshStandardMaterial).metalness = 0
+  if ('metalnessMap' in m) (m as THREE.MeshStandardMaterial).metalnessMap = undefined
+  m.side = THREE.FrontSide
+  m.needsUpdate = true
   return m
 }
 

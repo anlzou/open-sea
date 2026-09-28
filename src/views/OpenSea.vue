@@ -73,6 +73,11 @@ const simPaused = ref(false)
 const simSpeed = ref(1)
 const aquariumSize = ref(20)
 const showBoundary = ref(false)
+const skeletalAnim = ref(true)
+const skeletalSoftCap = ref(96)
+const skeletalCount = ref(20)
+const skeletalCountMax = ref(96)
+const recommendedSkeletalCount = ref(20)
 
 // Weather system state
 const weatherSystem = ref(null)
@@ -90,6 +95,7 @@ const fishDisplay = ref({
   turnRate: 4, topMargin: 0.42,
   koiPerception: 2.7, koiSpeed: 1.0, koiSeparation: 1.35,
   koiAvoidance: 10, koiTurnRate: 4, koiTopMargin: 0.42,
+  skeletalCount: 20,
 })
 
 function t(key) {
@@ -860,6 +866,11 @@ function toggleBoundary() {
   if (fishSystem.value) fishSystem.value.toggleBoundary(showBoundary.value)
 }
 
+function toggleSkeletalAnim() {
+  skeletalAnim.value = !skeletalAnim.value
+  if (fishSystem.value) fishSystem.value.onSkeletalAnimChange(skeletalAnim.value)
+}
+
 // 风暴模式：进入拉满海况 + 2.0x 速度，离开恢复；通过 target 值在帧循环中平滑过渡
 let stormActive = false
 let stormPrevSeaSlider = 45
@@ -910,6 +921,11 @@ function onFishControl(key, e) {
   switch (key) {
     case 'sardineCount': fishSystem.value.onSardineCountChange(val); break
     case 'koiCount': fishSystem.value.onKoiCountChange(val); break
+    case 'skeletalCount':
+      skeletalCount.value = val
+      fishSystem.value.onSkeletalCountChange(val)
+      fishDisplay.value.sardineCount = fishSystem.value.controls.sardineCount.value
+      break
     default:
       if (key in ctrl) {
         ctrl[key].value = val
@@ -933,9 +949,31 @@ function scheduleSecondarySystems() {
       controls,
       aquariumSize: aquariumSize.value,
       showBoundary: showBoundary.value,
+      enableSkeletalAnim: skeletalAnim.value,
+      qualityTier: PERF?.tier ?? 2,
     })
     fishCamActive.value = false
     fishModelKeys.value = fishSystem.value.modelKeys
+    skeletalSoftCap.value = fishSystem.value.controls.skeletalCount.max
+    skeletalCountMax.value = fishSystem.value.controls.skeletalCount.max
+    recommendedSkeletalCount.value = fishSystem.value.recommendedSkeletalCount
+    skeletalCount.value = fishSystem.value.controls.skeletalCount.value
+    fishDisplay.value.skeletalCount = skeletalCount.value
+    fishDisplay.value.sardineCount = fishSystem.value.controls.sardineCount.value
+    fishDisplay.value.koiCount = fishSystem.value.controls.koiCount.value
+
+    // Sync display once models finish loading (defaults already applied in createFishSystem)
+    const syncWhenReady = () => {
+      if (disposed || !fishSystem.value) return
+      if (!fishSystem.value.ready) {
+        requestAnimationFrame(syncWhenReady)
+        return
+      }
+      skeletalCount.value = fishSystem.value.controls.skeletalCount.value
+      fishDisplay.value.skeletalCount = skeletalCount.value
+      fishDisplay.value.sardineCount = fishSystem.value.controls.sardineCount.value
+    }
+    requestAnimationFrame(syncWhenReady)
     setTimeout(() => {
       if (disposed) return
       if (fishSystem.value?.loadError) {
@@ -1254,6 +1292,11 @@ onBeforeUnmount(() => {
       :fish-load-progress="fishLoadProgress"
       :fish-model-keys="fishModelKeys"
       :fish-display="fishDisplay"
+      :skeletal-anim="skeletalAnim"
+      :skeletal-soft-cap="skeletalSoftCap"
+      :skeletal-count="skeletalCount"
+      :skeletal-count-max="skeletalCountMax"
+      :recommended-skeletal-count="recommendedSkeletalCount"
       :meteor-cfg="meteorCfg"
       :fps="fpsDisplay"
       :quality-badge="qualityBadge"
@@ -1273,6 +1316,7 @@ onBeforeUnmount(() => {
       @lightning-flash="onLightningFlashChange"
       @aquarium-size="onAquariumSizeChange"
       @toggle-boundary="toggleBoundary"
+      @toggle-skeletal-anim="toggleSkeletalAnim"
       @fish-control="onFishControl"
       @meteor-mode="onMeteorMode"
       @meteor-cfg="onMeteorCfg"

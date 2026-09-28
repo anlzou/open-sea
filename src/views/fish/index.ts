@@ -5,10 +5,17 @@ import {
   setFishMeshCount,
   disposeFishMesh,
   updateFishInstances,
+  updateFishInstancesRange,
 } from './instanced-school-renderer.js'
+import {
+  createSkinnedFishSchool,
+  SKELETAL_ANIM_HARD_MAX,
+  type SkinnedFishSchool,
+} from './skinned-school-renderer.js'
 import { loadFishModel, isReady, getLoadError, getLoadProgress, getModelKeys } from './model-loader.js'
 import { createCameraRig } from './camera-rig.js'
 import { createDefaultSettings, obstacles, virtualAquarium, setAquariumSize } from './config.js'
+import { recommendSkeletalFishCount } from './perf-budget.js'
 import type { FishState } from './types.js'
 
 export interface FishSystemOptions {
@@ -18,6 +25,12 @@ export interface FishSystemOptions {
   koiCount?: number
   aquariumSize?: number
   showBoundary?: boolean
+  /** Default true — Swim / TurnLeft / TurnRight skeletal clips */
+  enableSkeletalAnim?: boolean
+  /** Adaptive quality tier 0–4; used to pick default animated fish count */
+  qualityTier?: number
+  /** Override auto-recommended skeletal fish count */
+  skeletalCount?: number
 }
 
 export interface FishControls {
@@ -35,6 +48,10 @@ export interface FishControls {
   koiTurnRate: { value: number; min: number; max: number; step: number }
   koiTopMargin: { value: number; min: number; max: number; step: number }
   koiSpeed: { value: number; min: number; max: number; step: number }
+  /** Skeletal Swim/Turn clips (expensive); off = InstancedMesh + curve deform */
+  enableSkeletalAnim: { value: boolean }
+  /** How many fish use bone clips (0…HARD_MAX); rest fall back to curve deform */
+  skeletalCount: { value: number; min: number; max: number }
 }
 
 export interface FishSystem {
@@ -44,6 +61,8 @@ export interface FishSystem {
   loadError: string | null
   loadProgress: number
   modelKeys: string[]
+  skeletalSoftCap: number
+  recommendedSkeletalCount: number
   getRandomFish(): FishState | null
   update(dt: number): void
   updateLights(sunDir: THREE.Vector3, sunColor: THREE.Color): void
@@ -54,10 +73,31 @@ export interface FishSystem {
   onControlChange(): void
   onSardineCountChange(value: number): void
   onKoiCountChange(value: number): void
+  onSkeletalAnimChange(enabled: boolean): void
+  onSkeletalCountChange(value: number): void
 }
 
 export function createFishSystem(options: FishSystemOptions): FishSystem {
-  const { scene, controls: orbitControls, aquariumSize: initSize, showBoundary: initShowBoundary } = options
+  const {
+    scene,
+    controls: orbitControls,
+    aquariumSize: initSize,
+    showBoundary: initShowBoundary,
+    enableSkeletalAnim: initSkeletal = true,
+    qualityTier = 2,
+    skeletalCount: initSkeletalCount,
+    sardineCount: initSardineCount,
+    koiCount: initKoiCount,
+  } = options
+
+  const recommendedSkeletalCount = recommendSkeletalFishCount(qualityTier)
+  const initialAnimated = Math.max(
+    0,
+    Math.min(
+      SKELETAL_ANIM_HARD_MAX,
+      initSkeletalCount ?? recommendedSkeletalCount,
+    ),
+  )
 
   // ---- Simulation setup ----
   const sardineSettings = createDefaultSettings()
@@ -86,6 +126,8 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
   const koiCapacity = 1000
   let sardineMesh: THREE.InstancedMesh | null = null
   let koiMesh: THREE.InstancedMesh | null = null
+  let sardineSkinned: SkinnedFishSchool | null = null
+  let koiSkinned: SkinnedFishSchool | null = null
 
   // ---- Lights for fish (OpenSea has no Three.js lights, only TSL procedural) ----
   const ambientLight = new THREE.AmbientLight(0x446688, 0.6)
@@ -101,9 +143,13 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
   const baseMinSpeed = sardineSettings.minSpeed
   const baseMaxSpeed = sardineSettings.maxSpeed
 
+  // Default: seed sardines to the performance-recommended animated count (user can raise later)
+  const defaultSardines = initSardineCount ?? (initSkeletal ? initialAnimated : 0)
+  const defaultKoi = initKoiCount ?? 0
+
   const controls: FishControls = {
-    sardineCount: { value: 0, min: 0, max: 1000 },
-    koiCount: { value: 0, min: 0, max: 1000 },
+    sardineCount: { value: defaultSardines, min: 0, max: 1000 },
+    koiCount: { value: defaultKoi, min: 0, max: 1000 },
     perception: { value: 2.7, min: 1.2, max: 5.2, step: 0.1 },
     sardineSpeed: { value: 1.0, min: 0.2, max: 2.0, step: 0.05 },
     separation: { value: 1.35, min: 0.4, max: 3.0, step: 0.1 },
@@ -116,10 +162,17 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
     koiTurnRate: { value: 4, min: 0.5, max: 8, step: 0.1 },
     koiTopMargin: { value: 0.42, min: 0, max: 2, step: 0.05 },
     koiSpeed: { value: 1.0, min: 0.2, max: 2.0, step: 0.05 },
+    enableSkeletalAnim: { value: initSkeletal },
+    skeletalCount: { value: initialAnimated, min: 0, max: SKELETAL_ANIM_HARD_MAX },
+  }
+
+  function skeletalBudget(): number {
+    if (!controls.enableSkeletalAnim.value) return 0
+    return Math.max(0, Math.min(SKELETAL_ANIM_HARD_MAX, Math.round(controls.skeletalCount.value)))
   }
 
   function buildMeshes() {
-    const sm = createFishMeshByKey(sardineCapacity, 'cartoon')
+    const sm = createFishMeshByKey(sardineCapacity, 'fish')
     if (sm) {
       sardineMesh = sm
       setFishMeshCount(sardineMesh, sardineSim.fish.length)
@@ -132,6 +185,52 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
       setFishMeshCount(koiMesh, koiSim.fish.length)
       scene.add(koiMesh)
       if (koiSim.fish.length > 0) updateFishInstances(koiMesh, koiSim.fish)
+    }
+
+    sardineSkinned = createSkinnedFishSchool(scene, {
+      capacity: SKELETAL_ANIM_HARD_MAX,
+      renderScale: 1,
+    })
+    koiSkinned = createSkinnedFishSchool(scene, {
+      capacity: SKELETAL_ANIM_HARD_MAX,
+      renderScale: 1.15,
+      materialTint: 0xffc8a8,
+    })
+    syncRenderMode()
+  }
+
+  function syncRenderMode() {
+    const skeletal = controls.enableSkeletalAnim.value
+    if (sardineSkinned) sardineSkinned.setVisible(skeletal)
+    if (koiSkinned) koiSkinned.setVisible(skeletal)
+
+    if (!skeletal) {
+      applySchoolRender(sardineSim.fish, sardineMesh, sardineSkinned, 0)
+      applySchoolRender(koiSim.fish, koiMesh, koiSkinned, 0)
+      return
+    }
+
+    const budget = skeletalBudget()
+    const sardineSkinnedN = Math.min(sardineSim.fish.length, budget)
+    const koiSkinnedN = Math.min(koiSim.fish.length, Math.max(0, budget - sardineSkinnedN))
+    applySchoolRender(sardineSim.fish, sardineMesh, sardineSkinned, sardineSkinnedN)
+    applySchoolRender(koiSim.fish, koiMesh, koiSkinned, koiSkinnedN)
+  }
+
+  function applySchoolRender(
+    fish: FishState[],
+    mesh: THREE.InstancedMesh | null,
+    skinned: SkinnedFishSchool | null,
+    skinnedN: number,
+  ) {
+    const n = Math.max(0, Math.min(fish.length, skinnedN))
+    skinned?.setCount(n)
+    const rest = fish.length - n
+    setFishMeshCount(mesh, rest)
+    if (mesh && rest > 0) updateFishInstancesRange(mesh, fish, n, rest)
+    else if (mesh && rest === 0 && n === 0 && fish.length > 0) {
+      setFishMeshCount(mesh, fish.length)
+      updateFishInstances(mesh, fish)
     }
   }
 
@@ -162,15 +261,39 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
   function onSardineCountChange(value: number) {
     controls.sardineCount.value = value
     sardineSim.setCount(value)
-    setFishMeshCount(sardineMesh, sardineSim.fish.length)
-    updateFishInstances(sardineMesh, sardineSim.fish)
+    syncRenderMode()
   }
 
   function onKoiCountChange(value: number) {
     controls.koiCount.value = value
     koiSim.setCount(value)
-    setFishMeshCount(koiMesh, koiSim.fish.length)
-    if (koiMesh) updateFishInstances(koiMesh, koiSim.fish)
+    syncRenderMode()
+  }
+
+  function onSkeletalAnimChange(enabled: boolean) {
+    controls.enableSkeletalAnim.value = enabled
+    // First time enabling with zero fish — seed to recommended budget
+    if (enabled && controls.sardineCount.value === 0 && controls.koiCount.value === 0) {
+      const n = controls.skeletalCount.value || recommendedSkeletalCount
+      controls.skeletalCount.value = n
+      onSardineCountChange(n)
+      return
+    }
+    syncRenderMode()
+  }
+
+  function onSkeletalCountChange(value: number) {
+    const n = Math.max(0, Math.min(SKELETAL_ANIM_HARD_MAX, Math.round(value)))
+    controls.skeletalCount.value = n
+    // Keep enough simulated fish so the skinned budget is visible
+    if (controls.enableSkeletalAnim.value) {
+      const total = controls.sardineCount.value + controls.koiCount.value
+      if (total < n) {
+        onSardineCountChange(n)
+        return
+      }
+    }
+    syncRenderMode()
   }
 
   // ------- Visual boundary wireframe -------
@@ -264,8 +387,7 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
     // Re-seed fish positions to fit new bounds
     sardineSim.reset(sardineSim.fish.length)
     koiSim.reset(koiSim.fish.length, 142)
-    updateFishInstances(sardineMesh, sardineSim.fish)
-    if (koiMesh) updateFishInstances(koiMesh, koiSim.fish)
+    syncRenderMode()
     rebuildBoundary()
   }
 
@@ -283,8 +405,23 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
     sardineSim.update(simDt)
     koiSim.update(simDt)
 
-    updateFishInstances(sardineMesh, sardineSim.fish)
-    if (koiMesh) updateFishInstances(koiMesh, koiSim.fish)
+    const skeletal = controls.enableSkeletalAnim.value
+    if (skeletal) {
+      const budget = skeletalBudget()
+      const sN = Math.min(sardineSim.fish.length, budget)
+      sardineSkinned?.update(sardineSim.fish, simDt)
+      const sRest = sardineSim.fish.length - sN
+      if (sRest > 0) updateFishInstancesRange(sardineMesh, sardineSim.fish, sN, sRest)
+
+      const kBudget = Math.max(0, budget - sN)
+      const kN = Math.min(koiSim.fish.length, kBudget)
+      koiSkinned?.update(koiSim.fish, simDt)
+      const kRest = koiSim.fish.length - kN
+      if (koiMesh && kRest > 0) updateFishInstancesRange(koiMesh, koiSim.fish, kN, kRest)
+    } else {
+      updateFishInstances(sardineMesh, sardineSim.fish)
+      if (koiMesh) updateFishInstances(koiMesh, koiSim.fish)
+    }
 
     cameraRig.update(simDt)
   }
@@ -305,6 +442,8 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
   function dispose() {
     disposeFishMesh(sardineMesh)
     disposeFishMesh(koiMesh)
+    sardineSkinned?.dispose()
+    koiSkinned?.dispose()
     scene.remove(ambientLight)
     scene.remove(hemiLight)
     scene.remove(fishSunLight)
@@ -315,6 +454,8 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
     get loadError() { return getLoadError() },
     get loadProgress() { return getLoadProgress() },
     get modelKeys() { return getModelKeys() },
+    get skeletalSoftCap() { return controls.skeletalCount.value },
+    recommendedSkeletalCount,
     cameraRig,
     controls,
     getRandomFish,
@@ -327,5 +468,7 @@ export function createFishSystem(options: FishSystemOptions): FishSystem {
     onControlChange,
     onSardineCountChange,
     onKoiCountChange,
+    onSkeletalAnimChange,
+    onSkeletalCountChange,
   }
 }

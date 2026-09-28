@@ -22,6 +22,11 @@ const props = defineProps({
   fishLoadProgress: { type: Number, default: 1 },
   fishModelKeys: { type: Array, default: () => [] },
   fishDisplay: { type: Object, required: true },
+  skeletalAnim: { type: Boolean, default: true },
+  skeletalSoftCap: { type: Number, default: 96 },
+  skeletalCount: { type: Number, default: 20 },
+  skeletalCountMax: { type: Number, default: 96 },
+  recommendedSkeletalCount: { type: Number, default: 20 },
   meteorCfg: { type: Object, required: true },
   fps: { type: [Number, String], default: '--' },
   qualityBadge: { type: String, default: '' },
@@ -45,6 +50,7 @@ const emit = defineEmits([
   'aquariumSize',
   'toggleBoundary',
   'fishControl',
+  'toggleSkeletalAnim',
   'meteorMode',
   'meteorCfg',
   'meteorShower',
@@ -238,6 +244,21 @@ onBeforeUnmount(() => {
               <button type="button" class="pill" :class="{ active: showBoundary }" @click="emit('toggleBoundary')">{{ showBoundary ? 'ON' : 'OFF' }}</button>
               <output>{{ aquariumSize }}×{{ aquariumSize }}</output>
             </label>
+
+            <label class="field-row with-toggle" style="margin-bottom:10px;">
+              <span>{{ t('fish.skeletalAnim') }}</span>
+              <button type="button" class="pill" :class="{ active: skeletalAnim }" :disabled="!fishReady"
+                @click="emit('toggleSkeletalAnim')">{{ skeletalAnim ? 'ON' : 'OFF' }}</button>
+              <output style="font-size:10px;opacity:.7;">推荐 {{ recommendedSkeletalCount }}</output>
+            </label>
+            <label class="field-row" style="margin-bottom:6px;">
+              <span>{{ t('fish.skeletalCount') }}</span>
+              <input type="range" :min="0" :max="skeletalCountMax" step="1" :value="skeletalCount"
+                :disabled="!fishReady || !skeletalAnim"
+                @input="emit('fishControl', 'skeletalCount', $event)" />
+              <output>{{ skeletalCount }}</output>
+            </label>
+            <p class="help-text" style="margin:-2px 0 10px;">{{ t('fish.skeletalAnimHelp').replace('{cap}', String(skeletalCountMax)) }}</p>
 
             <div class="group-label">沙丁鱼</div>
             <label class="field-row">

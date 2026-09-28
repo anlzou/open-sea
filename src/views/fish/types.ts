@@ -45,6 +45,11 @@ export interface FishMotionState {
   swimAccelerationTime: number
   swimAccelerationArmed: boolean
   bank: number
+  /**
+   * Smoothed horizontal turn bias in [-1, 1].
+   * +1 = turning left (CCW from above), -1 = turning right, 0 = straight.
+   */
+  turnBias: number
   curveBendWorld: THREE.Vector3
   introDropDirection?: THREE.Vector3
 }

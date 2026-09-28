@@ -74,7 +74,7 @@ export const obstacles = []
 
 export const fishModelSources = [
   {
-    key: 'cartoon',
+    key: 'fish',
     useAppearanceVariants: false,
   },
   {
